@@ -7,34 +7,71 @@ import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.client.SodiumCompat;
 import dev.upscaler.mixin.CommandEncoderAccessor;
+import org.joml.Matrix4f;
+import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkImageCopy;
 
+import java.nio.ByteBuffer;
+
 /**
- * P0 on-screen composite: each frame, ray-trace the triangle TLAS into a screen-sized storage
- * image, blend it 50/50 with the upscaled world color, and copy the blended result back to the
- * world target at the end-of-world seam. Gated by {@code -Dupscaler.rt.composite=true}.
+ * On-screen composite. Each frame, ray-trace into a screen-sized storage image, blend it 50/50
+ * with a storage-capable copy of the upscaled world color, and copy the result back to the world
+ * target at the end-of-world seam. Gated by {@code -Dupscaler.rt.composite=true}.
  *
- * <p>Pipeline/SBT/descriptor are built once; screen-sized images are rebuilt on resize.
+ * <p>When {@link RtTerrain} has been extracted (P1), traces real terrain with perspective camera
+ * rays (camera matrices captured each frame via {@link #captureFrame}); otherwise falls back to
+ * the P0 triangle. Pipelines/SBT/descriptors are built once; screen-sized images rebuilt on resize.
  */
 public final class RtComposite {
     public static final RtComposite INSTANCE = new RtComposite();
     public static final boolean ENABLED = Boolean.parseBoolean(System.getProperty("upscaler.rt.composite", "false"));
+    /** Blend weight of RT over vanilla: 0 = vanilla only, 1 = RT only. {@code -Dupscaler.rt.blend}. */
+    public static final float BLEND = parseBlend();
 
-    private RtPipeline pipeline;
+    private static final int WORLD_PUSH_SIZE = 80; // mat4 invViewProj (64) + vec3 camOffset (12, pad to 16)
+
+    private static float parseBlend() {
+        try {
+            return Math.clamp(Float.parseFloat(System.getProperty("upscaler.rt.blend", "0.5")), 0f, 1f);
+        } catch (NumberFormatException e) {
+            return 0.5f;
+        }
+    }
+
+    private RtPipeline trianglePipeline;
+    private RtPipeline worldPipeline;
     private RtBlendPipeline blendPipeline;
     private RtImage output;
     private RtImage baseCopy;
-    private long boundTlas;
+    private long boundTriangleTlas;
+    private long boundWorldTlas;
     private boolean failed;
     private boolean loggedActive;
+
+    // Camera captured each frame from GameRenderer (unjittered level projection + camera rotation + pos).
+    private final Matrix4f frameProjection = new Matrix4f();
+    private final Matrix4f frameViewRotation = new Matrix4f();
+    private double camX;
+    private double camY;
+    private double camZ;
+    private boolean frameCaptured;
 
     private RtComposite() {
     }
 
-    /** Called at the end-of-world seam when {@code ENABLED}. Returns true if it took over the frame. */
+    /** Capture the frame's camera for the next composite. Called from GameRendererMixin. */
+    public void captureFrame(Matrix4f projection, Matrix4fc viewRotation, double cameraX, double cameraY, double cameraZ) {
+        frameProjection.set(projection);
+        frameViewRotation.set(viewRotation);
+        camX = cameraX;
+        camY = cameraY;
+        camZ = cameraZ;
+        frameCaptured = true;
+    }
+
     public boolean composite(GpuTexture nativeColor, int width, int height) {
         if (failed) {
             return false;
@@ -43,17 +80,21 @@ public final class RtComposite {
         if (ctx == null) {
             return false;
         }
-        RtTriangleScene scene = RtTriangleScene.currentOrNull();
-        if (scene == null) {
-            return false; // scene not built yet (first tick hasn't run)
+        boolean useWorld = RtTerrain.currentOrNull() != null && frameCaptured;
+        if (!useWorld && RtTriangleScene.currentOrNull() == null) {
+            return false; // nothing to trace yet
         }
         try {
-            ensureSetup(ctx, scene.tlas());
+            if (blendPipeline == null) {
+                blendPipeline = RtBlendPipeline.create(ctx);
+            }
             ensureOutput(ctx, width, height);
-            recordFrame(nativeColor, width, height);
+            RtPipeline active = useWorld ? ensureWorld(ctx) : ensureTriangle(ctx);
+            recordFrame(active, useWorld, nativeColor, width, height);
             if (!loggedActive) {
                 loggedActive = true;
-                UpscalerMod.LOGGER.info("RT composite active: tracing {}x{} and blending over the world target at 50%", width, height);
+                UpscalerMod.LOGGER.info("RT composite active ({}): {}x{}, RT blended at {} over the world target",
+                        useWorld ? "terrain" : "triangle", width, height, BLEND);
             }
             return true;
         } catch (Throwable t) {
@@ -63,17 +104,34 @@ public final class RtComposite {
         }
     }
 
-    private void ensureSetup(RtContext ctx, long tlas) {
-        if (pipeline == null) {
-            pipeline = RtPipeline.create(ctx, "triangle.rgen.spv", "triangle.rmiss.spv", "triangle.rchit.spv");
+    private RtPipeline ensureWorld(RtContext ctx) {
+        if (worldPipeline == null) {
+            worldPipeline = RtPipeline.create(ctx, "world.rgen.spv", "world.rmiss.spv", "world.rchit.spv", WORLD_PUSH_SIZE);
+            if (output != null) {
+                worldPipeline.setStorageImage(output.view);
+            }
         }
-        if (blendPipeline == null) {
-            blendPipeline = RtBlendPipeline.create(ctx);
+        long tlas = RtTerrain.currentOrNull().tlas();
+        if (boundWorldTlas != tlas) {
+            worldPipeline.setTlas(tlas);
+            boundWorldTlas = tlas;
         }
-        if (boundTlas != tlas) {
-            pipeline.setTlas(tlas);
-            boundTlas = tlas;
+        return worldPipeline;
+    }
+
+    private RtPipeline ensureTriangle(RtContext ctx) {
+        if (trianglePipeline == null) {
+            trianglePipeline = RtPipeline.create(ctx, "triangle.rgen.spv", "triangle.rmiss.spv", "triangle.rchit.spv");
+            if (output != null) {
+                trianglePipeline.setStorageImage(output.view);
+            }
         }
+        long tlas = RtTriangleScene.currentOrNull().tlas();
+        if (boundTriangleTlas != tlas) {
+            trianglePipeline.setTlas(tlas);
+            boundTriangleTlas = tlas;
+        }
+        return trianglePipeline;
     }
 
     private void ensureOutput(RtContext ctx, int width, int height) {
@@ -90,23 +148,38 @@ public final class RtComposite {
         }
         output = ctx.createStorageImage(width, height);
         baseCopy = ctx.createStorageImage(width, height);
-        pipeline.setStorageImage(output.view);
+        if (trianglePipeline != null) {
+            trianglePipeline.setStorageImage(output.view);
+        }
+        if (worldPipeline != null) {
+            worldPipeline.setStorageImage(output.view);
+        }
         blendPipeline.setImages(baseCopy.view, output.view);
     }
 
-    private void recordFrame(GpuTexture nativeColor, int width, int height) {
+    private void recordFrame(RtPipeline active, boolean useWorld, GpuTexture nativeColor, int width, int height) {
         long dstImage = vkImage(nativeColor);
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            pipeline.trace(cmd, width, height);
+            if (useWorld) {
+                RtTerrain terrain = RtTerrain.currentOrNull();
+                ByteBuffer push = stack.malloc(WORLD_PUSH_SIZE);
+                new Matrix4f(frameProjection).mul(frameViewRotation).invert().get(0, push);
+                push.putFloat(64, (float) (camX - terrain.blockX));
+                push.putFloat(68, (float) (camY - terrain.blockY));
+                push.putFloat(72, (float) (camZ - terrain.blockZ));
+                active.trace(cmd, width, height, push);
+            } else {
+                active.trace(cmd, width, height);
+            }
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
             VK10.vkCmdCopyImage(cmd, dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL,
                     baseCopy.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, width, height));
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
-            blendPipeline.dispatch(cmd, width, height);
+            blendPipeline.dispatch(cmd, width, height, BLEND);
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
             VK10.vkCmdCopyImage(cmd, baseCopy.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
@@ -132,11 +205,16 @@ public final class RtComposite {
             blendPipeline.destroy();
             blendPipeline = null;
         }
-        if (pipeline != null) {
-            pipeline.destroy();
-            pipeline = null;
+        if (worldPipeline != null) {
+            worldPipeline.destroy();
+            worldPipeline = null;
         }
-        boundTlas = 0L;
+        if (trianglePipeline != null) {
+            trianglePipeline.destroy();
+            trianglePipeline = null;
+        }
+        boundTriangleTlas = 0L;
+        boundWorldTlas = 0L;
     }
 
     private static long vkImage(GpuTexture texture) {

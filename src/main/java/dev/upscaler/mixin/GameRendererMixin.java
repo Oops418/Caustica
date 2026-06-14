@@ -5,6 +5,7 @@ import dev.upscaler.client.DlssPipeline;
 import dev.upscaler.client.FsrPipeline;
 import dev.upscaler.client.UpscalerJitter;
 import dev.upscaler.client.WorldRenderScaler;
+import dev.upscaler.rt.RtComposite;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
 import org.joml.Matrix4f;
@@ -66,6 +67,12 @@ public abstract class GameRendererMixin {
 		var cameraState = this.gameRenderState().levelRenderState.cameraRenderState;
 		FsrPipeline.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix, cameraState.pos, cameraState.depthFar);
 		DlssPipeline.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix, cameraState.pos);
+		RtComposite.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix,
+				cameraState.pos.x, cameraState.pos.y, cameraState.pos.z);
+		if (RtComposite.ENABLED) {
+			// RT compare: skip jitter so the ray-traced terrain aligns pixel-perfectly with vanilla.
+			return projection;
+		}
 
 		float jx = UpscalerJitter.INSTANCE.jitterNdcX();
 		float jy = UpscalerJitter.INSTANCE.jitterNdcY();

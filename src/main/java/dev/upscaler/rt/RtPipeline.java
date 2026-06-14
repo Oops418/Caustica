@@ -13,6 +13,7 @@ import org.lwjgl.vulkan.VkDescriptorSetLayoutCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
 import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
+import org.lwjgl.vulkan.VkPushConstantRange;
 import org.lwjgl.vulkan.VkRayTracingPipelineCreateInfoKHR;
 import org.lwjgl.vulkan.VkRayTracingShaderGroupCreateInfoKHR;
 import org.lwjgl.vulkan.VkShaderModuleCreateInfo;
@@ -57,9 +58,10 @@ public final class RtPipeline {
     private final long pipeline;
     private final RtBuffer sbt;
     private final long sbtStride;
+    private final int pushConstantSize;
     private boolean destroyed;
 
-    private RtPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline, RtBuffer sbt, long stride) {
+    private RtPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline, RtBuffer sbt, long stride, int pushConstantSize) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
@@ -68,9 +70,14 @@ public final class RtPipeline {
         this.pipeline = pipeline;
         this.sbt = sbt;
         this.sbtStride = stride;
+        this.pushConstantSize = pushConstantSize;
     }
 
     public static RtPipeline create(RtContext ctx, String rgen, String rmiss, String rchit) {
+        return create(ctx, rgen, rmiss, rchit, 0);
+    }
+
+    public static RtPipeline create(RtContext ctx, String rgen, String rmiss, String rchit, int pushConstantSize) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(2, stack);
@@ -96,6 +103,11 @@ public final class RtPipeline {
             long set = pSet.get(0);
 
             VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(dsl));
+            if (pushConstantSize > 0) {
+                VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack)
+                        .stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR).offset(0).size(pushConstantSize);
+                plci.pPushConstantRanges(pcr);
+            }
             check(VK10.vkCreatePipelineLayout(vk, plci, null, p), "vkCreatePipelineLayout");
             long layout = p.get(0);
 
@@ -137,7 +149,7 @@ public final class RtPipeline {
             for (int g = 0; g < groupCount; g++) {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
-            return new RtPipeline(ctx, dsl, pool, set, layout, pipeline, sbt, stride);
+            return new RtPipeline(ctx, dsl, pool, set, layout, pipeline, sbt, stride, pushConstantSize);
         }
     }
 
@@ -163,11 +175,18 @@ public final class RtPipeline {
         }
     }
 
-    /** Record bind + trace into the given command buffer. */
     public void trace(VkCommandBuffer cmd, int width, int height) {
+        trace(cmd, width, height, null);
+    }
+
+    /** Record bind (+ optional raygen push constants) + trace into the given command buffer. */
+    public void trace(VkCommandBuffer cmd, int width, int height, java.nio.ByteBuffer pushConstants) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VK10.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
             VK10.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, stack.longs(descriptorSet), null);
+            if (pushConstants != null && pushConstantSize > 0) {
+                VK10.vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_RAYGEN_BIT_KHR, 0, pushConstants);
+            }
             VkStridedDeviceAddressRegionKHR raygen = VkStridedDeviceAddressRegionKHR.calloc(stack)
                     .deviceAddress(sbt.deviceAddress).stride(sbtStride).size(sbtStride);
             VkStridedDeviceAddressRegionKHR miss = VkStridedDeviceAddressRegionKHR.calloc(stack)

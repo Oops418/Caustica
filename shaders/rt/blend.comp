@@ -5,6 +5,10 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(binding = 0, set = 0, rgba8) uniform image2D baseImage;
 layout(binding = 1, set = 0, rgba8) uniform readonly image2D rtImage;
 
+layout(push_constant) uniform Push {
+    float blend; // 0 = vanilla only, 1 = RT only
+} pc;
+
 void main() {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(baseImage);
@@ -14,5 +18,5 @@ void main() {
 
     vec4 base = imageLoad(baseImage, pix);
     vec4 rt = imageLoad(rtImage, pix);
-    imageStore(baseImage, pix, mix(base, rt, 0.5));
+    imageStore(baseImage, pix, mix(base, rt, pc.blend));
 }

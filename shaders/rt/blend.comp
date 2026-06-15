@@ -10,10 +10,18 @@ layout(push_constant) uniform Push {
 } pc;
 
 // Tonemap seam: map HDR RT radiance to displayable LDR before compositing over the LDR world target.
-// P3.0 placeholder is a clamp — byte-identical to the old rgba8 trace target, which clamped on store.
-// P3.1 replaces this with a real operator (Reinhard/ACES) once the path tracer emits true HDR values.
+// P3.1 emits true HDR (sun NEE + multi-bounce can exceed 1), so we apply exposure + the Narkowicz
+// ACES filmic curve. (When P4's DLSS Ray Reconstruction lands it consumes the HDR pre-tonemap; this
+// stays the final display-mapping step for the composite path.)
+const float EXPOSURE = 1.1;
+
+vec3 acesFilmic(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
 vec3 tonemap(vec3 hdr) {
-    return clamp(hdr, 0.0, 1.0);
+    return acesFilmic(hdr * EXPOSURE);
 }
 
 void main() {

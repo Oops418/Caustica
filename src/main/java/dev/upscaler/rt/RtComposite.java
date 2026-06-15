@@ -331,6 +331,12 @@ public final class RtComposite {
                 push.putFloat(164, mvCamDeltaY);
                 push.putFloat(168, mvCamDeltaZ);
                 active.trace(cmd, width, height, push);
+                // P4.2a checkpoint: bring up DLSS-RR (NGX init + availability gate + feature creation)
+                // at native resolution. Per-frame evaluate + composite follow; for now the feature is
+                // created (and logged) but not yet consumed.
+                if (RtDlssRr.ENABLED) {
+                    RtDlssRr.INSTANCE.ensureFeature(cmd.address(), width, height, width, height);
+                }
             } else {
                 active.trace(cmd, width, height);
             }
@@ -354,6 +360,9 @@ public final class RtComposite {
     }
 
     public void destroy() {
+        if (RtDlssRr.ENABLED) {
+            RtDlssRr.INSTANCE.destroy();
+        }
         if (baseCopy != null) {
             baseCopy.destroy();
             baseCopy = null;

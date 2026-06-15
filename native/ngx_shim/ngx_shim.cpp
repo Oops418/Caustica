@@ -29,6 +29,7 @@ static int g_lastResult = 0;
 struct DlssFeature {
     NVSDK_NGX_Handle* handle;
     NVSDK_NGX_Parameter* params;
+    bool ownsParams; // false when params is the shared capability block (DLSS-RR), so release leaves it
 };
 
 static NVSDK_NGX_Resource_VK makeImageResource(VkImageView view, VkImage image, int format,
@@ -188,6 +189,7 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlss(VkCommandBuffer cmd,
     DlssFeature* feature = (DlssFeature*) std::malloc(sizeof(DlssFeature));
     feature->handle = handle;
     feature->params = params;
+    feature->ownsParams = true; // allocated above; release destroys it
     return feature;
 }
 
@@ -250,12 +252,15 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
                                            unsigned int renderWidth, unsigned int renderHeight,
                                            unsigned int displayWidth, unsigned int displayHeight,
                                            int quality, int featureFlags, int renderPreset) {
-    NVSDK_NGX_Parameter* params = nullptr;
-    NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_AllocateParameters(&params);
-    g_lastResult = (int) r;
-    if (NVSDK_NGX_FAILED(r)) {
+    // DLSS Ray Reconstruction must be created with the capability parameter block (it carries the
+    // snippet/preset callbacks the feature needs); a fresh AllocateParameters block fails with
+    // FAIL_InvalidParameter. The block is shared (freed at shutdown), so the feature does not own it.
+    NVSDK_NGX_Parameter* params = g_capabilityParams;
+    if (!params) {
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_NotInitialized;
         return nullptr;
     }
+    NVSDK_NGX_Result r = NVSDK_NGX_Result_Success;
 
     if (renderPreset != 0) {
         unsigned int preset = (unsigned int) renderPreset;
@@ -276,20 +281,24 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     createParams.InHeight = renderHeight;
     createParams.InTargetWidth = displayWidth;
     createParams.InTargetHeight = displayHeight;
-    createParams.InPerfQualityValue = (NVSDK_NGX_PerfQuality_Value) quality;
+    // Native resolution (render == display) is the DLAA mode; the upscaling quality values (MaxQuality
+    // etc.) imply a fixed render:display ratio and are rejected with FAIL_InvalidParameter at 1:1.
+    createParams.InPerfQualityValue = (renderWidth == displayWidth && renderHeight == displayHeight)
+            ? NVSDK_NGX_PerfQuality_Value_DLAA
+            : (NVSDK_NGX_PerfQuality_Value) quality;
     createParams.InFeatureCreateFlags = featureFlags;
 
     NVSDK_NGX_Handle* handle = nullptr;
     r = NGX_VULKAN_CREATE_DLSSD_EXT1(g_device, cmd, 1, 1, &handle, params, &createParams);
     g_lastResult = (int) r;
     if (NVSDK_NGX_FAILED(r)) {
-        NVSDK_NGX_VULKAN_DestroyParameters(params);
-        return nullptr;
+        return nullptr; // params is the shared capability block; do not destroy it
     }
 
     DlssFeature* feature = (DlssFeature*) std::malloc(sizeof(DlssFeature));
     feature->handle = handle;
     feature->params = params;
+    feature->ownsParams = false; // shared capability block, freed at shutdown
     return feature;
 }
 
@@ -354,7 +363,7 @@ NGX_SHIM_EXPORT void ngxshim_release(void* feature) {
     if (f->handle) {
         NVSDK_NGX_VULKAN_ReleaseFeature(f->handle);
     }
-    if (f->params) {
+    if (f->params && f->ownsParams) {
         NVSDK_NGX_VULKAN_DestroyParameters(f->params);
     }
     std::free(f);

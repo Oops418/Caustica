@@ -23,7 +23,7 @@ public final class RtEntityCapture implements VertexConsumer {
     final FloatArrayList verts = new FloatArrayList();   // 3 floats/vertex (capture-space position)
     final IntArrayList idx = new IntArrayList();         // 3 indices/triangle
     final FloatArrayList uvList = new FloatArrayList();  // 2 floats/vertex (entity-texture UV, for P5.1b-2b)
-    final FloatArrayList prim = new FloatArrayList();    // 8 floats/triangle: normal.xyz + 0, tint.rgb + 0
+    final FloatArrayList prim = new FloatArrayList();    // 12 floats/triangle: normal.xyz+0, tint.rgb+texSlot, mat.{rough,metal,0,0}
 
     // P5.1b-2b: the bindless texture slot for the geometry currently being submitted (set by the
     // collector per submitModel, so body + feature layers get their own texture). Stored per-prim in
@@ -152,7 +152,7 @@ public final class RtEntityCapture implements VertexConsumer {
         float tr = ((c >> 16) & 0xFF) * (1f / 255f);
         float tg = ((c >> 8) & 0xFF) * (1f / 255f);
         float tb = (c & 0xFF) * (1f / 255f);
-        for (int t = 0; t < 2; t++) { // one {normal+emission, tint} record per triangle
+        for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
             prim.add(nx);
             prim.add(ny);
             prim.add(nz);
@@ -161,6 +161,10 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(tg);
             prim.add(tb);
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot (P5.1b-2b)
+            prim.add(RtMaterials.ENTITY_ROUGH); // P6.1: entities default to a matte dielectric
+            prim.add(0f);                       // metalness
+            prim.add(0f);
+            prim.add(0f);
         }
     }
 

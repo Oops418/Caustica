@@ -12,6 +12,8 @@ import dev.upscaler.client.UpscalerJitter;
 import dev.upscaler.mixin.CommandEncoderAccessor;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.core.BlockPos;
+import net.minecraft.tags.FluidTags;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
@@ -47,7 +49,8 @@ public final class RtComposite {
 
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
-    private static final int WORLD_PUSH_SIZE = 192;
+    // + flags(@192): P6.1 bit 0 = camera submerged, bit 1 = PBR BRDF enabled
+    private static final int WORLD_PUSH_SIZE = 196;
     private static final int GUIDE_COUNT = 5; // P4 guide buffers bound at world-pipeline bindings 3..7
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
@@ -351,6 +354,14 @@ public final class RtComposite {
             push.putInt(172, SPP);
             push.putFloat(176, jitterX);
             push.putFloat(180, jitterY);
+            // P6.1 flags: PBR BRDF toggle + camera-in-water (so the path tracer starts in the water
+            // medium when the eye is submerged, fixing the air->water first-segment orientation).
+            int flags = RtMaterials.ENABLED ? 0b10 : 0;
+            var level = Minecraft.getInstance().level;
+            if (level != null && level.getFluidState(BlockPos.containing(camX, camY, camZ)).is(FluidTags.WATER)) {
+                flags |= 0b01;
+            }
+            push.putInt(192, flags);
 
             // P5.1a/b: rebuild the TLAS this frame from the static section instances merged with
             // dynamic entity-box instances, bind it into the pipeline's descriptor ring, record the

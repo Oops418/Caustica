@@ -52,12 +52,17 @@ layout(push_constant) uniform Push {
     // P4.2b sub-pixel camera jitter, in render pixels (the same Halton offset reported to DLSS-RR).
     // Applied to the primary ray only; the motion-vector pass keeps the unjittered pixel centre.
     layout(offset = 176) vec2 jitter;
+    // (offset 184 is the closest-hit/any-hit entityTableAddr (u64); raygen ignores it.)
+    // P6.1 flags: bit 0 = camera is submerged in water (init the dielectric medium), bit 1 = PBR BRDF
+    // enabled (else the legacy Lambertian path + diffuse-only guides for a clean A/B).
+    layout(offset = 192) uint flags;
 } pc;
 
 // First-hit (primary-visibility) guide attributes, captured at bounce 0 of tracePath. The primary ray
 // is deterministic (no AA jitter yet), so every SPP sample's bounce 0 yields identical values.
 vec3 gv_normal;
 vec3 gv_albedo;
+vec3 gv_specAlb; // P6.1: specular albedo (F0) fed to DLSS-RR for specular demodulation (0 = pure diffuse).
 float gv_rough;
 // Linear VIEW-SPACE depth (perpendicular distance from the camera plane), computed in main() from
 // gv_hitCamRel · camForward — this is what DLSS-RR's Depth_Type_Linear wants, not the slant ray
@@ -76,6 +81,8 @@ struct Payload {
     float emission; // hit: block light level 0..1; 0 on miss.
     vec3 motionPrev; // hit: world displacement since last frame (entity per-object MV); 0 otherwise.
     float material; // hit: 0 = opaque diffuse, 1 = water (smooth dielectric); 0 on miss.
+    float roughness; // P6.1: perceptual roughness for the GGX BRDF.
+    float metalness; // P6.1: 0 = dielectric, 1 = conductor.
 };
 layout(location = 0) rayPayloadEXT Payload payload;
 layout(location = 1) rayPayloadEXT float shadowVis; // 1.0 if the visibility ray escaped, else 0.0
@@ -101,6 +108,37 @@ const float WATER_IOR = 1.333;
 const vec3 WATER_ABSORB = vec3(0.42, 0.12, 0.08); // extinction per block (linear units)
 const vec3 WATER_GUIDE_ALBEDO = vec3(0.04, 0.10, 0.16);
 const float WATER_GUIDE_ROUGH = 0.08;
+// P6.1: clear-water specular reflectance at normal incidence, F0 = ((n-1)/(n+1))^2 for n = 1.333.
+// Fed to DLSS-RR as the water surface's specular albedo so RR resolves stable reflection/refraction
+// instead of treating the surface as noisy diffuse (the source of the 1-spp shimmer).
+const vec3 WATER_F0 = vec3(0.02);
+
+// P6.1 GGX BRDF. Roughness is clamped away from 0 so the delta sun's specular highlight stays finite
+// and the VNDF sample is well-conditioned. alpha = roughness^2 (perceptual -> GGX) throughout.
+const float MIN_ROUGH = 0.045;
+
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// GGX normal distribution.
+float ggxD(float ndh, float rough) {
+    float a = rough * rough;
+    float a2 = a * a;
+    float d = ndh * ndh * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d + 1.0e-7);
+}
+
+// Smith GGX masking term for one direction (separable form; G2 = G1(v) * G1(l)).
+float ggxG1(float ndx, float rough) {
+    float a = rough * rough;
+    float a2 = a * a;
+    return 2.0 * ndx / (ndx + sqrt(a2 + (1.0 - a2) * ndx * ndx) + 1.0e-7);
+}
+
+vec3 fresnelSchlick(float cosT, vec3 f0) {
+    float m = clamp(1.0 - cosT, 0.0, 1.0);
+    float m2 = m * m;
+    return f0 + (1.0 - f0) * (m2 * m2 * m);
+}
 
 // Exact (unpolarized) Fresnel reflectance for a dielectric interface. cosI is the incidence cosine on
 // the incoming side; etaI/etaT are the IORs the ray travels from / into. Returns 1.0 on total internal
@@ -140,6 +178,32 @@ vec3 cosineDir(vec3 n, inout uint s) {
     return normalize(local.x * t + local.y * b + local.z * n);
 }
 
+// Sample a GGX visible-normal (VNDF, Heitz 2018) about geometric normal n for view ve, returning the
+// sampled microfacet normal (half-vector) in world space. alpha = rough^2. Paired with the separable
+// Smith term, the importance-sampling weight reduces to F * G1(NdotL) (applied by the caller).
+vec3 sampleGGXVNDF(vec3 n, vec3 ve, float rough, inout uint s) {
+    vec3 t = normalize(abs(n.x) > 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0));
+    vec3 b = normalize(cross(n, t));
+    t = cross(b, n);
+    vec3 Ve = vec3(dot(ve, t), dot(ve, b), dot(ve, n)); // view in tangent space (z = n)
+    float a = rough * rough;
+    vec3 Vh = normalize(vec3(a * Ve.x, a * Ve.y, Ve.z));
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    vec3 T1 = lensq > 0.0 ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(lensq) : vec3(1.0, 0.0, 0.0);
+    vec3 T2 = cross(Vh, T1);
+    float u1 = rndf(s);
+    float u2 = rndf(s);
+    float r = sqrt(u1);
+    float phi = 6.2831853 * u2;
+    float p1 = r * cos(phi);
+    float p2 = r * sin(phi);
+    float ss = 0.5 * (1.0 + Vh.z);
+    p2 = (1.0 - ss) * sqrt(1.0 - p1 * p1) + ss * p2;
+    vec3 Nh = p1 * T1 + p2 * T2 + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * Vh;
+    vec3 Ne = normalize(vec3(a * Nh.x, a * Nh.y, max(0.0, Nh.z))); // microfacet normal, tangent space
+    return normalize(Ne.x * t + Ne.y * b + Ne.z * n);             // -> world space
+}
+
 float visibility(vec3 origin, vec3 dir, float tmax) {
     shadowVis = 0.0; // assume occluded; shadow.rmiss sets 1.0 if the ray escapes
     // No opaque force: cutout geometry (foliage/glass) runs world.rahit and alpha-tests, so leaves
@@ -155,7 +219,10 @@ float visibility(vec3 origin, vec3 dir, float tmax) {
 vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
     vec3 L = vec3(0.0);
     vec3 throughput = vec3(1.0);
-    bool inWater = false; // medium tracking for dielectric water (Fresnel + Beer–Lambert absorption)
+    bool pbr = (pc.flags & 2u) != 0u; // P6.1: GGX BRDF + material guides (else legacy Lambertian)
+    // P6.1: start submerged if the camera is in water (fixes the air->water first-segment orientation
+    // + absorption when the eye is underwater; without it the first hit was treated as an air segment).
+    bool inWater = (pc.flags & 1u) != 0u;
     for (int bounce = 0; bounce <= MAX_BOUNCES; bounce++) {
         payload.hitT = -1.0;
         // No opaque flag: cutout geometry stays alpha-tested via world.rahit on every path ray, so
@@ -167,6 +234,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
             if (bounce == 0) { // primary ray hit sky: guides describe "no surface"
                 gv_normal = vec3(0.0);
                 gv_albedo = payload.albedo;
+                gv_specAlb = vec3(0.0);
                 gv_rough = 1.0;
                 gv_hitCamRel = rd * 1.0e6; // sky at infinity: only rotation parallax (-> large far depth)
                 gv_objDisp = vec3(0.0);    // sky is static
@@ -192,10 +260,14 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
         // duplicated FluidRenderer back-faces don't confuse the orientation; the normal `n` already
         // faces the incoming ray. The bounce cap bounds stacked refractions.
         if (payload.material > 0.5) {
-            if (bounce == 0) { // primary water hit: feed RR a stable, slightly glossy guide surface
+            if (bounce == 0) { // primary water hit: feed RR a smooth dielectric specular surface
+                // P6.1: no diffuse albedo (clear water), specular albedo = water F0, low roughness.
+                // This is the RR-water fix — RR now demodulates water as a specular surface and resolves
+                // the reflection/refraction stably instead of shimmering it as noisy diffuse at 1 spp.
                 gv_normal = n;
-                gv_albedo = WATER_GUIDE_ALBEDO;
-                gv_rough = WATER_GUIDE_ROUGH;
+                gv_albedo = vec3(0.0);
+                gv_specAlb = WATER_F0;
+                gv_rough = max(MIN_ROUGH, payload.roughness);
                 gv_hitCamRel = hitPos - pc.camOffset;
                 gv_objDisp = vec3(0.0); // water surface is static (no per-object MV)
             }
@@ -223,11 +295,20 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
 
         vec3 albedo = payload.albedo;
         vec3 p = hitPos + n * SURF_BIAS;
+        vec3 v = -rd; // view direction (toward the camera / incoming ray)
+
+        // P6.1 material split. Metals tint F0 by albedo and have no diffuse lobe; dielectrics use a
+        // fixed 0.04 F0. With PBR disabled this collapses to a pure Lambertian surface (the legacy look).
+        float rough = pbr ? clamp(payload.roughness, MIN_ROUGH, 1.0) : 1.0;
+        float metal = pbr ? clamp(payload.metalness, 0.0, 1.0) : 0.0;
+        vec3 diffAlb = albedo * (1.0 - metal);
+        vec3 F0 = mix(vec3(0.04), albedo, metal);
 
         if (bounce == 0) { // primary-visibility surface: capture the denoiser guide buffers
             gv_normal = n;
-            gv_albedo = albedo;
-            gv_rough = 1.0; // Lambertian for now (PBR roughness arrives in P6)
+            gv_albedo = pbr ? diffAlb : albedo;  // RR diffuse-albedo demodulation target
+            gv_specAlb = pbr ? F0 : vec3(0.0);   // RR specular-albedo demodulation target (was always 0)
+            gv_rough = rough;
             gv_hitCamRel = ro + rd * payload.hitT - pc.camOffset; // camera-relative hit position
             gv_objDisp = payload.motionPrev; // per-object world motion (0 for static terrain)
         }
@@ -240,14 +321,53 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
             L += throughput * albedo * payload.emission * EMISSIVE_STRENGTH;
         }
 
-        // NEE: direct sun (delta directional light). f = albedo/PI; contribution = f * E * N·L * vis.
+        // NEE: direct sun (delta directional light) — Lambert diffuse + GGX specular, one shadow ray.
+        // The specular term gives the sun glint on water/metals/smooth blocks (a known P5.2 gap).
         float ndl = max(0.0, dot(n, SUN_DIR));
         if (ndl > 0.0) {
-            L += throughput * albedo * INV_PI * SUN_RADIANCE * ndl * visibility(p, SUN_DIR, 10000.0);
+            float vis = visibility(p, SUN_DIR, 10000.0);
+            if (vis > 0.0) {
+                vec3 brdf = diffAlb * INV_PI; // Lambertian diffuse (f = albedo/PI)
+                if (pbr) {
+                    vec3 h = normalize(SUN_DIR + v);
+                    float ndh = max(0.0, dot(n, h));
+                    float ndv = max(1.0e-4, dot(n, v));
+                    float vdh = max(0.0, dot(v, h));
+                    float D = ggxD(ndh, rough);
+                    float G = ggxG1(ndv, rough) * ggxG1(ndl, rough); // separable Smith masking
+                    vec3 F = fresnelSchlick(vdh, F0);
+                    brdf += (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
+                }
+                L += throughput * brdf * SUN_RADIANCE * ndl * vis;
+            }
         }
 
-        // Indirect: cosine-weighted Lambertian continuation (PI and cos cancel into *= albedo).
-        throughput *= albedo;
+        // Indirect continuation: importance-sample the diffuse OR the GGX specular lobe, chosen by their
+        // relative reflectance. (PBR off: the legacy cosine-weighted Lambertian bounce, *= albedo.)
+        if (pbr) {
+            float ps = clamp(luminance(F0) / (luminance(F0) + luminance(diffAlb) + 1.0e-4), 0.1, 0.9);
+            if (rndf(seed) < ps) {
+                vec3 h = sampleGGXVNDF(n, v, rough, seed);
+                vec3 l = reflect(rd, h); // rd = -v: reflect the incoming ray about the microfacet normal
+                float ndl2 = dot(n, l);
+                if (ndl2 <= 0.0) {
+                    break; // microfacet reflects below the surface: terminate this path
+                }
+                // VNDF + separable Smith ⇒ weight = F · G2/G1(v) = F · G1(l); divide by the lobe pdf ps.
+                vec3 F = fresnelSchlick(max(0.0, dot(v, h)), F0);
+                throughput *= F * ggxG1(ndl2, rough) / ps;
+                ro = p;
+                rd = l;
+            } else {
+                throughput *= diffAlb / (1.0 - ps);
+                ro = p;
+                rd = cosineDir(n, seed);
+            }
+        } else {
+            throughput *= albedo; // legacy Lambertian (PI and cos cancel)
+            ro = p;
+            rd = cosineDir(n, seed);
+        }
 
         // Russian roulette on deeper bounces: survive with prob = max channel, rescale survivors.
         if (bounce >= RR_START) {
@@ -257,9 +377,6 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
             }
             throughput /= q;
         }
-
-        ro = p;
-        rd = cosineDir(n, seed);
     }
     return L;
 }
@@ -310,7 +427,7 @@ void main() {
     imageStore(gNormal, pix, vec4(gv_normal, gv_rough));
     imageStore(gAlbedo, pix, vec4(gv_albedo, 1.0));
     imageStore(gDepth, pix, vec4(gv_depth, 0.0, 0.0, 0.0));
-    imageStore(gSpecAlbedo, pix, vec4(0.0)); // diffuse-only path tracer: no specular albedo
+    imageStore(gSpecAlbedo, pix, vec4(gv_specAlb, 1.0)); // P6.1: specular albedo (F0) for RR demodulation
 
     // P4.0b motion vector: reproject this surface point through the previous frame's view-projection.
     // The primary ray was cast through the JITTERED ndc (jndc), so this hit's current screen position is
@@ -336,6 +453,8 @@ void main() {
             dbg = vec3(min(gv_depth / 64.0, 1.0)); // linear view depth, 64-block normalize (sky -> white)
         } else if (pc.debugView == 4u) {
             dbg = vec3(gv_rough);                   // roughness
+        } else if (pc.debugView == 6u) {
+            dbg = gv_specAlb;                       // specular albedo (F0)
         } else {
             dbg = vec3(clamp(0.5 + motion * 0.05, 0.0, 1.0), 0.5); // motion: red=+x, green=+y
         }

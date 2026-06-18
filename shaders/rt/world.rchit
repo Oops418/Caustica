@@ -12,6 +12,7 @@
 struct Prim {
     vec4 normal;
     vec4 tint;
+    vec4 mat; // P6.1: {roughness, metalness, 0, 0} heuristic PBR material (RtMaterials)
 };
 struct Section {
     uint64_t primAddr;
@@ -56,6 +57,8 @@ struct Payload {
     float emission; // block light level 0..1 (stashed in prim normal.w during extraction)
     vec3 motionPrev; // world displacement since last frame (entity per-object MV); 0 for static terrain
     float material;  // P5.2: 0 = opaque diffuse, 1 = water (smooth dielectric, handled in raygen)
+    float roughness; // P6.1: perceptual roughness for the GGX BRDF
+    float metalness; // P6.1: 0 = dielectric, 1 = conductor
 };
 layout(location = 0) rayPayloadInEXT Payload payload;
 hitAttributeEXT vec2 attribs;
@@ -91,6 +94,8 @@ void main() {
         payload.emission = 0.0;
         payload.motionPrev = g.disp.xyz; // per-object MV (P5.1c)
         payload.material = 0.0;          // entities are opaque
+        payload.roughness = pr.mat.x;    // P6.1
+        payload.metalness = pr.mat.y;
         return;
     }
 
@@ -120,4 +125,6 @@ void main() {
     payload.emission = pr.normal.w; // 0..1 light level, written by extraction into the free slot
     payload.motionPrev = vec3(0.0); // static terrain: camera-only motion vector
     payload.material = pr.tint.w;   // P5.2: 1 = water dielectric, 0 = opaque (set by extraction)
+    payload.roughness = pr.mat.x;   // P6.1
+    payload.metalness = pr.mat.y;
 }

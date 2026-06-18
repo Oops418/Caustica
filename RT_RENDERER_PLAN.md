@@ -326,8 +326,24 @@ to fill our own buffers — we do not consume its packed/culled render output.)
     `entitiesForRendering()` → a second pass scans loaded chunks (`BE_VIEW_CHUNKS`) and submits each via
     `BlockEntityRenderDispatcher` into the same collector (static, zero MV). `beginFrame` refactored into
     a shared `FrameBuild`/`appendCapture` tail across the entity + block-entity passes.
-- **P6 — PBR materials.** LabPBR resource-pack ingestion (normal/roughness/metallic/
-  emissive/SSS) + proper BRDF. Heuristic fallback when no PBR pack.
+- **P6 — PBR materials.** Proper BRDF + LabPBR resource-pack ingestion (normal/roughness/metallic/
+  emissive/SSS), heuristic fallback when no PBR pack.
+  - **P6.1 — GGX BRDF + heuristic materials + DLSS-RR specular/water fix (DONE in working tree).**
+    The path tracer gained a Cook–Torrance diffuse + GGX specular BRDF (VNDF importance sampling, sun
+    glint via specular NEE) in `world.rgen`. Each surface carries `(roughness, metalness)` in a new third
+    per-prim `vec4 mat` (`Prim` is now 48 B; `world.rchit`/`world.rahit` + all prim writers — `RtTerrain`
+    block & fluid, `RtEntityCapture` — updated in lockstep). A heuristic classifier (`RtMaterials`,
+    `SoundType`-keyed: metal/glass + a smooth-block set) assigns the pair at extraction; metals tint F0 by
+    albedo, dielectrics use F0 0.04. **The RR fix:** the first-hit guides now feed DLSS-RR the *demodulated*
+    diffuse albedo (`gAlbedo`), the **specular albedo `F0` (`gSpecAlbedo`, previously always 0)**, and the
+    **real roughness (`gNormal.w`, previously 1.0)** — so RR resolves specular/water as a stable specular
+    surface instead of shimmering it as noisy diffuse at 1 spp. Water is fed `diffuse 0 / specAlb = water
+    F0(0.02) / low roughness`; camera-underwater is fixed via a `flags` push bit (`@192`, also carrying the
+    `-Dupscaler.rt.pbr` toggle). No NGX/Java-NGX change (the `gSpecAlbedo` image + packed-roughness path
+    already existed). A/B: `-Dupscaler.rt.pbr=false` reverts to the legacy Lambertian look.
+  - **P6.2 — LabPBR per-texel ingestion (NEXT, deferred).** Build our own `_n`/`_s` parallel atlases from
+    a LabPBR pack (vanilla builds none) and sample roughness/metallic/normal/emissive/SSS per-texel in the
+    hit shader (the `mat.zw` lanes are reserved). Heuristic stays the fallback when no pack is present.
 - **P7 — Perf & polish.** AS compaction, SER tuning, texture-LOD via ray cones,
   distant-geometry LOD or hybrid far-field, variable sample counts, settings UI.
   - **Entity-path perf (deferred from P5.1, which prioritized correctness):** (1) pool + **refit**

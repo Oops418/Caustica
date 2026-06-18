@@ -553,7 +553,7 @@ public final class RtTerrain {
         final FloatArrayList verts = new FloatArrayList();
         final IntArrayList idx = new IntArrayList();
         final FloatArrayList uvList = new FloatArrayList(); // 2 floats/vertex: atlas UV
-        final FloatArrayList prim = new FloatArrayList();   // 8 floats/triangle: normal.xyz + emission, tint.rgb0
+        final FloatArrayList prim = new FloatArrayList();   // 12 floats/triangle: normal.xyz+emission, tint.rgb+material, mat.{rough,metal,0,0}
     }
 
     /** Captures the quads vanilla's model renderer emits into the current section's mesh. */
@@ -622,8 +622,12 @@ public final class RtTerrain {
             // (no per-prim layout change). The path tracer multiplies it by albedo for colored glow.
             float emission = state != null ? state.getLightEmission() / 15f : 0f;
 
+            // P6.1: heuristic PBR material (roughness, metalness) for the GGX BRDF / DLSS-RR guides.
+            float rough = RtMaterials.roughness(state);
+            float metal = RtMaterials.metalness(state);
+
             FloatArrayList prim = cur.prim;
-            for (int t = 0; t < 2; t++) { // one {normal+emission, tint} record per triangle
+            for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
                 prim.add(nx);
                 prim.add(ny);
                 prim.add(nz);
@@ -631,6 +635,10 @@ public final class RtTerrain {
                 prim.add(tr);
                 prim.add(tg);
                 prim.add(tb);
+                prim.add(0f);
+                prim.add(rough);
+                prim.add(metal);
+                prim.add(0f);
                 prim.add(0f);
             }
         }
@@ -713,8 +721,10 @@ public final class RtTerrain {
                 nz /= len;
             }
             float material = water ? 1f : 0f; // tint.w: 1 = water dielectric, 0 = opaque (lava)
+            // P6.1: water is a near-smooth dielectric; lava is a moderately rough opaque emitter.
+            float rough = water ? RtMaterials.WATER_ROUGH : RtMaterials.LAVA_ROUGH;
             FloatArrayList prim = cur.prim;
-            for (int t = 0; t < 2; t++) { // one {normal+emission, tint} record per triangle
+            for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
                 prim.add(nx);
                 prim.add(ny);
                 prim.add(nz);
@@ -723,6 +733,10 @@ public final class RtTerrain {
                 prim.add(1f);
                 prim.add(1f);
                 prim.add(material);
+                prim.add(rough);
+                prim.add(0f); // metalness (fluids are dielectric)
+                prim.add(0f);
+                prim.add(0f);
             }
         }
 

@@ -14,6 +14,7 @@
 struct Prim {
     vec4 normal;
     vec4 tint;
+    vec4 mat; // P6.1: unused here, but the array stride must match world.rchit / the uploaded buffer (48 B)
 };
 struct Section {
     uint64_t primAddr;

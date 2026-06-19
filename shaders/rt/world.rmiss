@@ -1,8 +1,9 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
 
-// Primary-ray miss: a simple sky gradient by ray height — placeholder until P3 lighting / a real sky
-// model. hitT < 0 tells raygen this was a miss (sky), so it stores the color directly.
+// Ray miss = sky. As of P6.3 the sky RADIANCE is computed in world.rgen's miss branch (the dynamic sky
+// needs the pushed sun direction, which this miss shader does not receive), so here we only flag the
+// miss with hitT < 0; payload.albedo is left at 0 and ignored by raygen.
 struct Payload {
     vec3 albedo;
     vec3 normal;
@@ -17,10 +18,7 @@ struct Payload {
 layout(location = 0) rayPayloadInEXT Payload payload;
 
 void main() {
-    float t = clamp(gl_WorldRayDirectionEXT.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3 horizon = vec3(0.62, 0.71, 0.86);
-    vec3 zenith = vec3(0.22, 0.45, 0.85);
-    payload.albedo = mix(horizon, zenith, t);
+    payload.albedo = vec3(0.0); // unused: raygen computes the dynamic sky from the pushed sun direction
     payload.hitT = -1.0;
     payload.emission = 0.0;
     payload.motionPrev = vec3(0.0);

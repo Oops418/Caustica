@@ -14,6 +14,9 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.core.BlockPos;
 import net.minecraft.tags.FluidTags;
+import net.minecraft.util.Mth;
+import net.minecraft.world.attribute.EnvironmentAttributes;
+import org.joml.Vector3f;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
@@ -50,7 +53,8 @@ public final class RtComposite {
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
     // + flags(@192): P6.1 bit 0 = camera submerged, bit 1 = PBR BRDF enabled
-    private static final int WORLD_PUSH_SIZE = 196;
+    // + P6.3 dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
+    private static final int WORLD_PUSH_SIZE = 256;
     private static final int GUIDE_COUNT = 5; // P4 guide buffers bound at world-pipeline bindings 3..7
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
@@ -61,6 +65,19 @@ public final class RtComposite {
     public static final int DEBUG_VIEW = Integer.getInteger("upscaler.rt.debugView", 0);
     /** Samples per pixel per frame. Default 1: DLSS-RR denoises ~1 spp; raise for the no-RR reference. */
     public static final int SPP = Math.max(1, Integer.getInteger("upscaler.rt.spp", 1));
+    /**
+     * P6.3 dynamic sky: drive the sun/moon direction, light colour and sky gradient from the game's time
+     * of day. {@code -Dupscaler.rt.dynamicSky=false} pins the legacy fixed noon sun for a clean A/B.
+     */
+    public static final boolean DYNAMIC_SKY = Boolean.parseBoolean(System.getProperty("upscaler.rt.dynamicSky", "true"));
+    /**
+     * P6.3b soft shadows: give the sun/moon a finite angular size so NEE shadow rays sample the light's
+     * disk (soft, contact-hardening penumbrae). {@code -Dupscaler.rt.softShadows=false} -> hard shadows.
+     * Radii in degrees; the real sun/moon are ~0.27° but a touch larger reads as a pleasant penumbra.
+     */
+    public static final boolean SOFT_SHADOWS = Boolean.parseBoolean(System.getProperty("upscaler.rt.softShadows", "true"));
+    private static final float SUN_ANGULAR_RADIUS = (float) Math.toRadians(Double.parseDouble(System.getProperty("upscaler.rt.sunAngularRadius", "0.6")));
+    private static final float MOON_ANGULAR_RADIUS = (float) Math.toRadians(Double.parseDouble(System.getProperty("upscaler.rt.moonAngularRadius", "1.5")));
     /**
      * P4.2b RT trace scale: the path tracer + guide buffers run at this fraction of display resolution
      * and DLSS-RR upscales to display. Only applied when {@link RtDlssRr#ENABLED}; the no-RR reference
@@ -376,6 +393,8 @@ public final class RtComposite {
                 flags |= 0b01;
             }
             push.putInt(192, flags);
+            // P6.3: sun/moon direction + light radiance + sky day-factor, derived from the time of day.
+            writeSky(push);
 
             // P5.1a/b: rebuild the TLAS this frame from the static section instances merged with
             // dynamic entity-box instances, bind it into the pipeline's descriptor ring, record the
@@ -446,6 +465,73 @@ public final class RtComposite {
             throw new IllegalStateException("vkEndCommandBuffer(rt composite) failed");
         }
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
+    }
+
+    /**
+     * P6.3 dynamic sky. Derive the celestial light from Minecraft's time of day and write it into the
+     * world push constant (three 16-byte-aligned vec4s at offsets 208/224/240):
+     * <ul>
+     *   <li>{@code sunDir.xyz} — the true sun direction (for the sky glow/disc), {@code .w} = dayFactor
+     *       (0 night .. 1 day), used to cross-fade the sky gradient.</li>
+     *   <li>{@code lightDir.xyz} — the active NEE light direction: the sun while it is above the horizon,
+     *       otherwise the moon (so surfaces still get soft moonlight at night); {@code .w} = the light's
+     *       angular radius in radians (P6.3b soft shadows; 0 when {@code softShadows=false}).</li>
+     *   <li>{@code lightRadiance.xyz} — that light's HDR colour: warm + dim near the horizon, white +
+     *       bright when high; dim cool moonlight at night.</li>
+     * </ul>
+     * 26.2 exposes the celestial angles via the camera's {@link EnvironmentAttributeProbe} (partial-tick
+     * interpolated). The sun render transform (YP(-90) then XP(sunAngle) applied to +Y) reduces to the
+     * world direction {@code (-sin a, cos a, 0)} — i.e. the sun arcs through the east-west vertical plane,
+     * straight up at noon (angle 0) and straight down at midnight. {@code dynamicSky=false} pins the
+     * legacy fixed noon sun (P3.1a constants) for an exact A/B.
+     */
+    private void writeSky(ByteBuffer push) {
+        float sunX, sunY, sunZ, dayFactor, lx, ly, lz, rr, rg, rb, lightRadius;
+        Minecraft mc = Minecraft.getInstance();
+        if (!DYNAMIC_SKY || mc.level == null) {
+            Vector3f s = new Vector3f(0.35f, 0.9f, 0.25f).normalize();
+            sunX = s.x; sunY = s.y; sunZ = s.z; dayFactor = 1f;
+            lx = s.x; ly = s.y; lz = s.z;
+            rr = 4.2f; rg = 4.0f; rb = 3.6f; // P3.1a SUN_RADIANCE
+            lightRadius = SOFT_SHADOWS ? SUN_ANGULAR_RADIUS : 0f;
+        } else {
+            float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+            var probe = mc.gameRenderer.mainCamera().attributeProbe();
+            float sunAngle = probe.getValue(EnvironmentAttributes.SUN_ANGLE, partial) * (float) (Math.PI / 180.0);
+            float moonAngle = probe.getValue(EnvironmentAttributes.MOON_ANGLE, partial) * (float) (Math.PI / 180.0);
+            sunX = -Mth.sin(sunAngle); sunY = Mth.cos(sunAngle); sunZ = 0f;
+            float mx = -Mth.sin(moonAngle), my = Mth.cos(moonAngle), mz = 0f;
+            dayFactor = smoothstep(-0.08f, 0.10f, sunY);
+            if (sunY > 0.0f) {
+                // Sun: fades out as it sets; warm at the horizon, white overhead.
+                float strength = smoothstep(-0.06f, 0.18f, sunY);
+                float warmth = smoothstep(0.0f, 0.30f, sunY);
+                float sunPeak = 4.6f;
+                lx = sunX; ly = sunY; lz = sunZ;
+                rr = 1.00f * sunPeak * strength;
+                rg = Mth.lerp(warmth, 0.42f, 0.96f) * sunPeak * strength;
+                rb = Mth.lerp(warmth, 0.18f, 0.90f) * sunPeak * strength;
+                lightRadius = SOFT_SHADOWS ? SUN_ANGULAR_RADIUS : 0f;
+            } else {
+                // Moon: dim cool light, fading in as the sun drops below the horizon.
+                float moonStrength = 1.0f - dayFactor;
+                float moonPeak = 0.30f;
+                lx = mx; ly = my; lz = mz;
+                rr = 0.30f * moonPeak * moonStrength;
+                rg = 0.36f * moonPeak * moonStrength;
+                rb = 0.55f * moonPeak * moonStrength;
+                lightRadius = SOFT_SHADOWS ? MOON_ANGULAR_RADIUS : 0f;
+            }
+        }
+        push.putFloat(208, sunX); push.putFloat(212, sunY); push.putFloat(216, sunZ); push.putFloat(220, dayFactor);
+        push.putFloat(224, lx); push.putFloat(228, ly); push.putFloat(232, lz); push.putFloat(236, lightRadius);
+        push.putFloat(240, rr); push.putFloat(244, rg); push.putFloat(248, rb); push.putFloat(252, 0f);
+    }
+
+    /** Hermite smoothstep matching GLSL semantics (0 below edge0, 1 above edge1). */
+    private static float smoothstep(float edge0, float edge1, float x) {
+        float t = Math.clamp((x - edge0) / (edge1 - edge0), 0f, 1f);
+        return t * t * (3f - 2f * t);
     }
 
     /** Free per-frame TLASes whose tracing frame is now far enough behind to be off all in-flight queues. */

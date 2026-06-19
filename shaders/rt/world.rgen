@@ -56,6 +56,11 @@ layout(push_constant) uniform Push {
     // P6.1 flags: bit 0 = camera is submerged in water (init the dielectric medium), bit 1 = PBR BRDF
     // enabled (else the legacy Lambertian path + diffuse-only guides for a clean A/B).
     layout(offset = 192) uint flags;
+    // P6.3 dynamic sky (pushed each frame from RtComposite, derived from the game's time of day):
+    layout(offset = 208) vec4 sunDir;        // xyz = true sun direction (sky glow/disc), w = dayFactor 0..1
+    layout(offset = 224) vec4 lightDir;      // xyz = active NEE light dir (sun above horizon, else moon),
+                                             // w = light angular radius in radians (P6.3b; 0 = hard shadow)
+    layout(offset = 240) vec4 lightRadiance; // xyz = HDR radiance of that light (warm/dim low, white high)
 } pc;
 
 // First-hit (primary-visibility) guide attributes, captured at bounce 0 of tracePath. The primary ray
@@ -91,9 +96,10 @@ layout(location = 1) rayPayloadEXT float shadowVis; // 1.0 if the visibility ray
 const float PI = 3.14159265359;
 const float INV_PI = 0.31830988618;
 
-const vec3 SUN_DIR = normalize(vec3(0.35, 0.9, 0.25));
-const vec3 SUN_RADIANCE = vec3(4.2, 4.0, 3.6); // directional sun irradiance (HDR; tonemapped later)
-const float SKY_GAIN = 1.0;     // scales the sky radiance returned by world.rmiss
+// P6.3 dynamic sky: the directional light (sun by day, moon by night) and the true sun direction (for
+// the sky glow/disc) are pushed from the CPU every frame (pc.lightDir / pc.lightRadiance / pc.sunDir),
+// derived from Minecraft's time of day. SKY_GAIN scales the analytic sky computed in skyRadiance().
+const float SKY_GAIN = 1.0;
 const float EMISSIVE_STRENGTH = 6.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
 const int MAX_BOUNCES = 4;      // indirect bounces before the path is cut
 const int RR_START = 2;         // begin Russian roulette after this bounce index
@@ -119,6 +125,32 @@ const vec3 WATER_F0 = vec3(0.02);
 const float MIN_ROUGH = 0.045;
 
 float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// P6.3 analytic sky. A vertical zenith<->horizon gradient cross-faded between day and night colours by
+// pc.sunDir.w (dayFactor), plus a warm halo around the true sun direction that intensifies and reddens
+// as the sun nears the horizon (sunrise/sunset). The bright sun disc is added for PRIMARY rays only:
+// the sun's direct lighting already comes from NEE, so adding the disc to indirect/continuation rays
+// would double-count it and spawn fireflies. Returned in the same HDR units as the rest of tracePath.
+const vec3 SKY_DAY_ZENITH    = vec3(0.10, 0.32, 0.82);
+const vec3 SKY_DAY_HORIZON   = vec3(0.58, 0.70, 0.92);
+const vec3 SKY_NIGHT_ZENITH  = vec3(0.004, 0.008, 0.022);
+const vec3 SKY_NIGHT_HORIZON = vec3(0.016, 0.024, 0.050);
+const vec3 SUN_DISC_RADIANCE = vec3(22.0, 19.0, 15.0);
+vec3 skyRadiance(vec3 dir, bool primary) {
+    float day = pc.sunDir.w;
+    float up = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 zenith  = mix(SKY_NIGHT_ZENITH,  SKY_DAY_ZENITH,  day);
+    vec3 horizon = mix(SKY_NIGHT_HORIZON, SKY_DAY_HORIZON, day);
+    vec3 col = mix(horizon, zenith, up);
+    vec3 sd = pc.sunDir.xyz;
+    float c = max(0.0, dot(dir, sd));
+    float lowSun = clamp(1.0 - max(sd.y, 0.0), 0.0, 1.0); // 1 when the sun is on/under the horizon
+    col += vec3(1.0, 0.5, 0.22) * pow(c, 6.0) * (0.25 + 0.9 * lowSun) * day;
+    if (primary) {
+        col += SUN_DISC_RADIANCE * smoothstep(0.9992, 0.9995, c) * clamp(sd.y + 0.1, 0.0, 1.0);
+    }
+    return col * SKY_GAIN;
+}
 
 // GGX normal distribution.
 float ggxD(float ndh, float rough) {
@@ -179,6 +211,24 @@ vec3 cosineDir(vec3 n, inout uint s) {
     return normalize(local.x * t + local.y * b + local.z * n);
 }
 
+// P6.3b soft shadows: sample a direction uniformly within a cone of half-angle `radius` (radians) about
+// `axis`. Giving the sun/moon a finite angular size lets the NEE shadow ray land somewhere on the light's
+// disk; averaged over frames by DLSS-RR this yields soft penumbrae that widen with occluder distance
+// (contact-hardening) — for free, since the light's irradiance is unchanged and only the visibility
+// becomes a soft average. radius <= 0 collapses to the exact direction (hard shadow).
+vec3 sampleCone(vec3 axis, float radius, inout uint s) {
+    float cosMax = cos(radius);
+    float u1 = rndf(s);
+    float u2 = rndf(s);
+    float cosT = 1.0 - u1 * (1.0 - cosMax); // uniform in solid angle over the cap
+    float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+    float phi = 6.2831853 * u2;
+    vec3 t = normalize(abs(axis.x) > 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0));
+    vec3 b = normalize(cross(axis, t));
+    t = cross(b, axis);
+    return normalize(sinT * cos(phi) * t + sinT * sin(phi) * b + cosT * axis);
+}
+
 // Sample a GGX visible-normal (VNDF, Heitz 2018) about geometric normal n for view ve, returning the
 // sampled microfacet normal (half-vector) in world space. alpha = rough^2. Paired with the separable
 // Smith term, the importance-sampling weight reduces to F * G1(NdotL) (applied by the caller).
@@ -232,15 +282,18 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
         traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xFFu, 0u, 0u, 0u, ro, 0.0, rd, 10000.0, 0);
 
         if (payload.hitT < 0.0) {
+            // P6.3: the sky colour is computed here (not in world.rmiss) because the dynamic sky needs
+            // the pushed sun direction, which the miss shader does not receive. The disc is primary-only.
+            vec3 sky = skyRadiance(rd, bounce == 0);
             if (bounce == 0) { // primary ray hit sky: guides describe "no surface"
                 gv_normal = vec3(0.0);
-                gv_albedo = payload.albedo;
+                gv_albedo = sky;
                 gv_specAlb = vec3(0.0);
                 gv_rough = 1.0;
                 gv_hitCamRel = rd * 1.0e6; // sky at infinity: only rotation parallax (-> large far depth)
                 gv_objDisp = vec3(0.0);    // sky is static
             }
-            L += throughput * payload.albedo * SKY_GAIN; // escaped to sky
+            L += throughput * sky; // escaped to sky (SKY_GAIN folded into skyRadiance)
             break;
         }
 
@@ -323,15 +376,24 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
             L += throughput * albedo * payload.emission * EMISSIVE_STRENGTH;
         }
 
-        // NEE: direct sun (delta directional light) — Lambert diffuse + GGX specular, one shadow ray.
-        // The specular term gives the sun glint on water/metals/smooth blocks (a known P5.2 gap).
-        float ndl = max(0.0, dot(n, SUN_DIR));
+        // NEE: direct light from the dominant celestial body (delta directional light = sun by day,
+        // moon by night; P6.3) — Lambert diffuse + GGX specular, one shadow ray. The specular term gives
+        // the glint on water/metals/smooth blocks (a known P5.2 gap).
+        // P6.3b: jitter the light direction within its angular radius (pc.lightDir.w) so the shadow ray
+        // samples the light's disk — soft penumbrae over accumulation. radius 0 = hard shadow. The same
+        // sampled direction drives ndl, the shadow ray, and the specular half-vector (finite sun glint).
+        vec3 lightDir = pc.lightDir.xyz;
+        float lightRadius = pc.lightDir.w;
+        if (lightRadius > 0.0) {
+            lightDir = sampleCone(lightDir, lightRadius, seed);
+        }
+        float ndl = max(0.0, dot(n, lightDir));
         if (ndl > 0.0) {
-            float vis = visibility(p, SUN_DIR, 10000.0);
+            float vis = visibility(p, lightDir, 10000.0);
             if (vis > 0.0) {
                 vec3 brdf = diffAlb * INV_PI; // Lambertian diffuse (f = albedo/PI)
                 if (pbr) {
-                    vec3 h = normalize(SUN_DIR + v);
+                    vec3 h = normalize(lightDir + v);
                     float ndh = max(0.0, dot(n, h));
                     float ndv = max(1.0e-4, dot(n, v));
                     float vdh = max(0.0, dot(v, h));
@@ -340,7 +402,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
                     vec3 F = fresnelSchlick(vdh, F0);
                     brdf += (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
                 }
-                L += throughput * brdf * SUN_RADIANCE * ndl * vis;
+                L += throughput * brdf * pc.lightRadiance.xyz * ndl * vis;
             }
         }
 

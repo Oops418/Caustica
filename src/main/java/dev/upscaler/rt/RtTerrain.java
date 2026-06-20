@@ -13,20 +13,19 @@ import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.BlockQuadOutput;
 import net.minecraft.client.renderer.block.BlockStateModelSet;
 import net.minecraft.client.renderer.block.FluidRenderer;
+import net.minecraft.client.renderer.block.FluidStateModelSet;
 import net.minecraft.client.renderer.block.ModelBlockRenderer;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+import net.minecraft.client.renderer.chunk.RenderRegionCache;
+import net.minecraft.client.renderer.chunk.RenderSectionRegion;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.tags.FluidTags;
-import net.minecraft.world.level.CardinalLighting;
-import net.minecraft.world.level.ColorResolver;
 import net.minecraft.world.level.block.RenderShape;
-import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.lighting.LevelLightEngine;
 import net.minecraft.world.level.material.FluidState;
 import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
@@ -38,6 +37,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Future;
 
 /**
  * P2 step 3: per-section terrain residency synced to vanilla's loaded chunks. A singleton manager
@@ -53,9 +53,11 @@ import java.util.Set;
  * transforms stay small at any world coordinate) and an {@code instanceCustomIndex} into a BDA
  * section table ({@code {primAddr, idxAddr, uvAddr}} per section) the hit shaders read.
  *
- * <p>Still synchronous: builds run on the client thread (amortized) and frees use {@code waitIdle}.
- * Block-edit dirty tracking (a {@code LevelExtractor} hook), deferred frees, and async BLAS/TLAS are
- * the next steps.
+ * <p>Tessellation reads only an immutable snapshot ({@link RenderSectionRegion}, captured on the render
+ * thread via {@link RenderRegionCache} exactly as vanilla's chunk compiler does), so under
+ * {@code -Dupscaler.rt.asyncTerrain} the meshing runs on {@link RtWorkerPool}; the snapshot, GPU buffer
+ * upload, BLAS prepare and queue submission all stay on the render thread. The BLAS build itself is an
+ * async GPU submit, and frees are deferred frames-in-flight-safe (no {@code waitIdle} on the hot path).
  */
 public final class RtTerrain {
     public static final boolean ENABLED = Boolean.parseBoolean(System.getProperty("upscaler.rt.terrain", "true"));
@@ -65,6 +67,18 @@ public final class RtTerrain {
     private static final int VIEW_CHUNKS_CAP = Integer.getInteger("upscaler.rt.viewChunksCap", 8);
     private static final int VIEW_SECTIONS_V = Integer.getInteger("upscaler.rt.viewSectionsV", 6);
     private static final int SECTIONS_PER_TICK = Integer.getInteger("upscaler.rt.sectionsPerTick", 24);
+    // Async terrain: tessellate sections on RtWorkerPool instead of inline on the render thread. The
+    // snapshot (RenderSectionRegion) and all Vulkan still happen on the render thread; only the meshing
+    // moves off. SECTIONS_PER_TICK then caps dispatches/tick; SECTION_RESULTS_PER_TICK caps uploads/tick.
+    private static final boolean ASYNC = Boolean.parseBoolean(System.getProperty("upscaler.rt.asyncTerrain", "false"));
+    // Async caps run higher than the sync SECTIONS_PER_TICK because the work left on the render thread is
+    // only the GPU upload (buffer create + memcpy) — tessellation, the expensive part, is on the pool —
+    // so per-tick async batches are cheaper than one sync batch even when several times larger.
+    private static final int ASYNC_DISPATCH_PER_TICK = Integer.getInteger("upscaler.rt.asyncDispatchPerTick", 64);
+    private static final int SECTION_RESULTS_PER_TICK = Integer.getInteger("upscaler.rt.sectionResultsPerTick", 64);
+    // Backpressure cap: stop dispatching once this many sections are in flight. Bounds queue depth and
+    // snapshot memory (each RenderSectionRegion holds 27 SectionCopies) when flying through the world.
+    private static final int MAX_INFLIGHT = Integer.getInteger("upscaler.rt.maxInflightSections", 192);
     private static final int SECTION_ENTRY_BYTES = 24; // {u64 primAddr, u64 idxAddr, u64 uvAddr}
     // Frames a retired resource must outlive before it's freed (> frames-in-flight). The frame counter
     // advances per composite; old TLAS/table/sections are freed this many frames after the swap.
@@ -77,6 +91,13 @@ public final class RtTerrain {
     private final Set<Long> empty = new HashSet<>(); // loaded, in-window sections with no geometry
     private final Set<Long> dirty = java.util.concurrent.ConcurrentHashMap.newKeySet(); // edited sections to re-extract
     private final List<Deferred> deferred = new ArrayList<>(); // frames-in-flight-safe frees
+    // ASYNC tessellation bookkeeping (render-thread only). `inFlight` maps a dispatched section key to a
+    // monotonic token; a completed job whose token no longer matches (section re-dirtied / unloaded /
+    // left the window since dispatch) is dropped. `jobs` holds the outstanding worker futures.
+    private final Map<Long, Long> inFlight = new HashMap<>();
+    private final List<TessJob> jobs = new ArrayList<>();
+    private long tessToken;
+    private boolean loggedTessFailure; // log the first worker tessellation failure (should never happen)
     private Pending pending; // in-flight async geometry build, or null
     private RtBuffer sectionTable;
     // Static section instances (BLAS address + sectionOrigin-rebase transform, customIndex = list
@@ -168,13 +189,16 @@ public final class RtTerrain {
             return;
         }
 
-        // One build in flight at a time: finalize it when the GPU finishes, and don't start another
-        // until then. The old geometry stays live and traceable throughout, so there's no stall.
+        // One GPU build in flight at a time. When it finishes, finalize and FALL THROUGH so this same
+        // tick prepares the next batch — tick() runs at 20 TPS, so returning here would waste a whole
+        // tick per build and halve fill throughput. While the build is still running, there's nothing to
+        // do on the render thread (workers keep meshing their queue regardless), so return.
         if (pending != null) {
             if (ctx.isAsyncDone(pending.op)) {
                 finalizePending(ctx);
+            } else {
+                return;
             }
-            return;
         }
 
         BlockPos pb = mc.player.blockPosition();
@@ -186,18 +210,30 @@ public final class RtTerrain {
         int hiY = Math.min(maxSecY, psy + VIEW_SECTIONS_V);
 
         List<SectionGeom> removed = new ArrayList<>();
+        List<int[]> reextract = new ArrayList<>(); // ASYNC: dirty sections to rebuild in place (kept resident)
 
-        // Re-extract edited sections: drop them from residency (and the empty set) so the window pass
-        // rebuilds the ones still in view. Snapshot+removeAll drains without losing concurrent adds.
+        // Re-extract edited sections. Snapshot+removeAll drains without losing concurrent adds.
         if (!dirty.isEmpty()) {
             List<Long> keys = new ArrayList<>(dirty);
             dirty.removeAll(keys);
             for (long key : keys) {
-                SectionGeom g = resident.remove(key);
-                if (g != null) {
-                    removed.add(g);
-                }
                 empty.remove(key);
+                inFlight.remove(key); // invalidate any in-flight tessellation of the now-stale section
+                if (ASYNC) {
+                    // Keep the old geometry resident + traced; re-dispatch and swap when the new mesh is
+                    // ready (no eviction gap → no flicker). Non-resident dirty keys fall through to the
+                    // normal window/missing pass.
+                    SectionGeom g = resident.get(key);
+                    if (g != null) {
+                        reextract.add(new int[]{g.sx >> 4, g.sy >> 4, g.sz >> 4});
+                    }
+                } else {
+                    // Sync rebuilds in the same tick, so evicting now leaves no visible gap.
+                    SectionGeom g = resident.remove(key);
+                    if (g != null) {
+                        removed.add(g);
+                    }
+                }
             }
         }
 
@@ -214,6 +250,7 @@ public final class RtTerrain {
                     long key = sectionKey(scx, scy, scz);
                     desired.add(key);
                     if (!resident.containsKey(key) && !empty.contains(key)
+                            && !inFlight.containsKey(key)
                             && neighborChunksReady(level, scx, scz)) {
                         missing.add(new int[]{scx, scy, scz});
                     }
@@ -230,18 +267,29 @@ public final class RtTerrain {
             }
         }
         empty.removeIf(k -> !desired.contains(k));
+        // Drop in-flight tessellations whose section left the window / unloaded since dispatch.
+        inFlight.keySet().removeIf(k -> !desired.contains(k));
 
         // Tessellate + upload new sections (BLAS build deferred to rebuild's single batched submission).
         List<PreparedSection> prepared = new ArrayList<>();
+        // Build nearest-first so terrain fills from the player outward.
         if (!missing.isEmpty()) {
-            // Build nearest-first so terrain fills from the player outward.
             missing.sort((a, b) -> Integer.compare(dist2(a, pcx, psy, pcz), dist2(b, pcx, psy, pcz)));
+        }
+        if (ASYNC) {
+            dispatchReextract(level, reextract);
+            dispatchTessellation(level, missing);
+            drainTessellation(ctx, prepared, removed);
+        } else if (!missing.isEmpty()) {
             ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, mc.getBlockColors());
-            BlockAndTintGetter view = new LevelView(level);
+            // Snapshot source. Tessellation reads only the captured RenderSectionRegion (block states,
+            // light, biome tint, block entities for the 18³ neighbourhood) — never the live ClientLevel —
+            // which is what makes moving the meshing to a worker pool safe. The cache reuses neighbour
+            // SectionCopies across the sections built this tick (mirrors vanilla's chunk compiler).
+            RenderRegionCache regionCache = new RenderRegionCache();
             BlockStateModelSet modelSet = mc.getModelManager().getBlockStateModelSet();
             QuadCapture capture = new QuadCapture();
             capture.blockColors = mc.getBlockColors();
-            capture.view = view;
             // Fluids (water/lava) have no baked model — they're meshed by FluidRenderer into a
             // VertexConsumer. FluidCapture is both the Output and the capturing builder.
             FluidRenderer fluidRenderer = new FluidRenderer(mc.getModelManager().getFluidStateModelSet());
@@ -254,11 +302,14 @@ public final class RtTerrain {
                 }
                 budget--;
                 long key = sectionKey(s[0], s[1], s[2]);
-                PreparedSection ps = prepareSection(ctx, level, modelSet, renderer, view, capture, fluidRenderer, fluidCapture, m, key, s[0], s[1], s[2]);
-                if (ps != null) {
-                    prepared.add(ps);
-                } else {
+                // Snapshot on the render thread (reads the live level); the resulting region is then
+                // a thread-safe BlockAndTintGetter the tessellation can run against off-thread.
+                RenderSectionRegion region = regionCache.createRegion(level, SectionPos.asLong(s[0], s[1], s[2]));
+                SectionMesh mesh = tessellate(region, modelSet, renderer, capture, fluidRenderer, fluidCapture, m, s[0], s[1], s[2]);
+                if (mesh.idx.isEmpty()) {
                     empty.add(key);
+                } else {
+                    prepared.add(uploadSection(ctx, mesh, key, s[0] << 4, s[1] << 4, s[2] << 4));
                 }
             }
         }
@@ -310,21 +361,28 @@ public final class RtTerrain {
         return dx * dx + dy * dy + dz * dz;
     }
 
-    /** Tessellate one section (section-local), upload its buffers, and prepare (not yet build) its BLAS; null if empty. */
-    private PreparedSection prepareSection(RtContext ctx, ClientLevel level, BlockStateModelSet modelSet,
-                                           ModelBlockRenderer renderer, BlockAndTintGetter view, QuadCapture capture,
-                                           FluidRenderer fluidRenderer, FluidCapture fluidCapture,
-                                           BlockPos.MutableBlockPos m, long key, int scx, int scy, int scz) {
+    /**
+     * Tessellate one section to a section-local CPU mesh. <b>Pure CPU + snapshot reads only</b> — no
+     * Vulkan, no shared mutable state — so this is the unit a worker thread runs. LabPBR material
+     * ingestion ({@link RtBlockMaterials#ensure}) creates/uploads GPU textures, so it is deferred: each
+     * triangle's sprite is recorded into {@link SectionMesh#triSprites} and resolved later on the render
+     * thread in {@link #uploadSection}. Returns the mesh (possibly empty — caller checks {@code idx}).
+     */
+    private static SectionMesh tessellate(RenderSectionRegion region, BlockStateModelSet modelSet,
+                                          ModelBlockRenderer renderer, QuadCapture capture,
+                                          FluidRenderer fluidRenderer, FluidCapture fluidCapture,
+                                          BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
         int sox = scx << 4, soy = scy << 4, soz = scz << 4;
         SectionMesh mesh = new SectionMesh();
         capture.cur = mesh;
+        capture.view = region;
         fluidCapture.cur = mesh;
         for (int lx = 0; lx < 16; lx++) {
             for (int ly = 0; ly < 16; ly++) {
                 for (int lz = 0; lz < 16; lz++) {
                     int wx = sox + lx, wy = soy + ly, wz = soz + lz;
                     m.set(wx, wy, wz);
-                    BlockState state = level.getBlockState(m);
+                    BlockState state = region.getBlockState(m);
                     if (state.isAir()) {
                         continue;
                     }
@@ -339,7 +397,7 @@ public final class RtTerrain {
                         // opaque emitter. Tagged per-prim so the path tracer can branch (see emitQuad).
                         fluidCapture.water = fluid.is(FluidTags.WATER);
                         try {
-                            fluidRenderer.tesselate(view, m, fluidCapture, state, fluid);
+                            fluidRenderer.tesselate(region, m, fluidCapture, state, fluid);
                         } catch (Throwable t) {
                             // skip a fluid whose meshing throws rather than failing the section
                         }
@@ -354,17 +412,23 @@ public final class RtTerrain {
                     try {
                         capture.state = state;
                         capture.pos = m;
-                        renderer.tesselateBlock(capture, lx, ly, lz, view, m, state, model, state.getSeed(m));
+                        renderer.tesselateBlock(capture, lx, ly, lz, region, m, state, model, state.getSeed(m));
                     } catch (Throwable t) {
                         // skip a block whose model rendering throws rather than failing the section
                     }
                 }
             }
         }
-        if (mesh.idx.isEmpty()) {
-            return null;
-        }
+        return mesh;
+    }
 
+    /**
+     * Upload a tessellated {@link SectionMesh} to GPU buffers and prepare (not yet build) its BLAS.
+     * <b>Render thread only</b> — creates Vulkan buffers and resolves LabPBR materials (which
+     * create/upload GPU textures). {@code mesh} must be non-empty.
+     */
+    private static PreparedSection uploadSection(RtContext ctx, SectionMesh mesh, long key, int sox, int soy, int soz) {
+        resolveMaterials(mesh);
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = mesh.verts.size() / 3;
@@ -390,6 +454,142 @@ public final class RtTerrain {
         return new PreparedSection(key, positions, indices, uvs, material, blas, sox, soy, soz);
     }
 
+    /**
+     * Patch each prim record's {@code mat.z/mat.w} (hasS/hasN) by ingesting its triangle's sprite into
+     * the LabPBR atlases. Deferred out of {@link #tessellate} because {@link RtBlockMaterials#ensure}
+     * creates/uploads GPU textures and mutates a non-concurrent cache — render thread only. The
+     * {@code triSprites} list is one entry per prim record (per triangle), aligned with {@code prim}.
+     */
+    private static void resolveMaterials(SectionMesh mesh) {
+        List<TextureAtlasSprite> tri = mesh.triSprites;
+        FloatArrayList prim = mesh.prim;
+        for (int t = 0; t < tri.size(); t++) {
+            TextureAtlasSprite sprite = tri.get(t);
+            if (sprite == null) {
+                continue; // fluids / untextured / RtMaterials disabled → flags stay at the 0 placeholder
+            }
+            int flags = RtBlockMaterials.INSTANCE.ensure(sprite);
+            int off = t * 12;
+            prim.set(off + 10, (flags & RtBlockMaterials.HAS_S) != 0 ? 1f : 0f);
+            prim.set(off + 11, (flags & RtBlockMaterials.HAS_N) != 0 ? 1f : 0f);
+        }
+    }
+
+    /**
+     * ASYNC: snapshot each missing section on the render thread and submit its tessellation to the worker
+     * pool. The per-task meshing objects (renderer / captures / MutableBlockPos) are allocated inside the
+     * job so nothing mutable is shared across threads; the captured {@code region}, model sets and block
+     * colors are read-only. Capped at {@link #SECTIONS_PER_TICK} dispatches per tick.
+     */
+    private void dispatchTessellation(ClientLevel level, List<int[]> missing) {
+        if (missing.isEmpty()) {
+            return;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        RenderRegionCache regionCache = new RenderRegionCache();
+        BlockStateModelSet modelSet = mc.getModelManager().getBlockStateModelSet();
+        FluidStateModelSet fluidModelSet = mc.getModelManager().getFluidStateModelSet();
+        BlockColors blockColors = mc.getBlockColors();
+        int budget = ASYNC_DISPATCH_PER_TICK;
+        for (int[] s : missing) {
+            if (budget <= 0 || inFlight.size() >= MAX_INFLIGHT) {
+                break;
+            }
+            budget--;
+            dispatchSection(level, regionCache, modelSet, fluidModelSet, blockColors, s[0], s[1], s[2]);
+        }
+    }
+
+    /**
+     * ASYNC re-extraction of edited (dirty) sections that are still resident: dispatch a fresh
+     * tessellation while leaving the old geometry resident and traced, so it's swapped — never evicted
+     * with a gap — when the new mesh is built (see {@link #startBuild} retiring the replaced geom). This
+     * is what prevents the visible flicker on block updates that plain eviction would cause.
+     */
+    private void dispatchReextract(ClientLevel level, List<int[]> reextract) {
+        if (reextract.isEmpty()) {
+            return;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        RenderRegionCache regionCache = new RenderRegionCache();
+        BlockStateModelSet modelSet = mc.getModelManager().getBlockStateModelSet();
+        FluidStateModelSet fluidModelSet = mc.getModelManager().getFluidStateModelSet();
+        BlockColors blockColors = mc.getBlockColors();
+        for (int[] s : reextract) {
+            // Skip ones the window pass freed this tick (out of view) — they're being retired, not rebuilt.
+            if (!resident.containsKey(sectionKey(s[0], s[1], s[2]))) {
+                continue;
+            }
+            dispatchSection(level, regionCache, modelSet, fluidModelSet, blockColors, s[0], s[1], s[2]);
+        }
+    }
+
+    /** Snapshot one section on the render thread and submit its tessellation to the worker pool. */
+    private void dispatchSection(ClientLevel level, RenderRegionCache regionCache, BlockStateModelSet modelSet,
+                                 FluidStateModelSet fluidModelSet, BlockColors blockColors, int sx, int sy, int sz) {
+        long key = sectionKey(sx, sy, sz);
+        RenderSectionRegion region = regionCache.createRegion(level, SectionPos.asLong(sx, sy, sz));
+        long token = ++tessToken;
+        Future<SectionMesh> future = RtWorkerPool.INSTANCE.submit(() -> {
+            ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, blockColors);
+            QuadCapture capture = new QuadCapture();
+            capture.blockColors = blockColors;
+            FluidRenderer fluidRenderer = new FluidRenderer(fluidModelSet);
+            FluidCapture fluidCapture = new FluidCapture();
+            BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+            return tessellate(region, modelSet, renderer, capture, fluidRenderer, fluidCapture, m, sx, sy, sz);
+        });
+        inFlight.put(key, token);
+        jobs.add(new TessJob(key, token, sx << 4, sy << 4, sz << 4, future));
+    }
+
+    /**
+     * ASYNC: upload finished worker meshes (up to {@link #SECTION_RESULTS_PER_TICK} per tick) on the
+     * render thread. A job whose token no longer matches {@link #inFlight} is stale — its section was
+     * re-dirtied / unloaded / left the window since dispatch — and is dropped without uploading.
+     */
+    private void drainTessellation(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed) {
+        int budget = SECTION_RESULTS_PER_TICK;
+        for (Iterator<TessJob> it = jobs.iterator(); it.hasNext() && budget > 0; ) {
+            TessJob job = it.next();
+            if (!job.future().isDone()) {
+                continue;
+            }
+            it.remove();
+            SectionMesh mesh;
+            try {
+                mesh = job.future().get();
+            } catch (Exception e) {
+                inFlight.remove(job.key());
+                if (!loggedTessFailure) {
+                    loggedTessFailure = true;
+                    UpscalerMod.LOGGER.warn("async terrain: tessellation task failed for section {},{},{}",
+                            job.sox() >> 4, job.soy() >> 4, job.soz() >> 4, e);
+                }
+                continue;
+            }
+            Long expected = inFlight.get(job.key());
+            boolean valid = expected != null && expected == job.token();
+            if (!valid) {
+                continue; // stale result; a newer dispatch (or none) supersedes it
+            }
+            inFlight.remove(job.key());
+            if (mesh.idx.isEmpty()) {
+                // Legitimately empty (air or fully-enclosed). If this was an in-place re-extract whose new
+                // state is empty, evict the old geom and retire it via the build swap (a startBuild runs
+                // because `removed` is now non-empty).
+                SectionGeom prev = resident.remove(job.key());
+                if (prev != null) {
+                    removed.add(prev);
+                }
+                empty.add(job.key());
+            } else {
+                prepared.add(uploadSection(ctx, mesh, job.key(), job.sox(), job.soy(), job.soz()));
+                budget--;
+            }
+        }
+    }
+
     /** A section tessellated + uploaded with a prepared (not-yet-built) BLAS, pending the batch build. */
     private record PreparedSection(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs, RtBuffer material,
                                    RtAccel.PreparedBlas blas, int sx, int sy, int sz) {
@@ -397,6 +597,10 @@ public final class RtTerrain {
 
     /** A deferred free: run {@code free} once the frame counter reaches {@code freeFrame}. */
     private record Deferred(long freeFrame, Runnable free) {
+    }
+
+    /** An outstanding async tessellation: {@code future} yields the section's CPU mesh on a worker. */
+    private record TessJob(long key, long token, int sox, int soy, int soz, Future<SectionMesh> future) {
     }
 
     /** An in-flight async BLAS build: the new section geometry/instances land when {@code op} completes. */
@@ -413,7 +617,12 @@ public final class RtTerrain {
      */
     private void startBuild(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed, int rbx, int rby, int rbz) {
         for (PreparedSection ps : prepared) {
-            resident.put(ps.key(), new SectionGeom(ps.positions(), ps.indices(), ps.uvs(), ps.material(), ps.blas().accel, ps.sx(), ps.sy(), ps.sz()));
+            SectionGeom prev = resident.put(ps.key(), new SectionGeom(ps.positions(), ps.indices(), ps.uvs(), ps.material(), ps.blas().accel, ps.sx(), ps.sy(), ps.sz()));
+            if (prev != null) {
+                // Re-extracted section (ASYNC in-place rebuild): the old geometry stayed traced until now;
+                // retire it with the swap so there's no eviction gap and no leak.
+                removed.add(prev);
+            }
         }
 
         List<SectionGeom> ordered = new ArrayList<>(resident.values());
@@ -496,8 +705,21 @@ public final class RtTerrain {
         }
     }
 
+    /** Cancel outstanding async tessellations and drop their bookkeeping (CPU-only — nothing to free). */
+    private void cancelJobs() {
+        if (jobs.isEmpty() && inFlight.isEmpty()) {
+            return;
+        }
+        for (TessJob job : jobs) {
+            job.future().cancel(true);
+        }
+        jobs.clear();
+        inFlight.clear();
+    }
+
     /** Full teardown (world exit / shutdown): drain the GPU, then free everything incl. an in-flight build. */
     private void clear(RtContext ctx) {
+        cancelJobs();
         if (pending == null && resident.isEmpty() && sectionTable == null && deferred.isEmpty()) {
             empty.clear();
             staticInstances = null;
@@ -575,7 +797,10 @@ public final class RtTerrain {
         final FloatArrayList verts = new FloatArrayList();
         final IntArrayList idx = new IntArrayList();
         final FloatArrayList uvList = new FloatArrayList(); // 2 floats/vertex: atlas UV
-        final FloatArrayList prim = new FloatArrayList();   // 12 floats/triangle: normal.xyz+emission, tint.rgb+material, mat.{rough,metal,0,0}
+        final FloatArrayList prim = new FloatArrayList();   // 12 floats/triangle: normal.xyz+emission, tint.rgb+material, mat.{rough,metal,hasS,hasN}
+        // One sprite per prim record (per triangle), aligned with `prim`. Resolved to hasS/hasN on the
+        // render thread (RtBlockMaterials.ensure touches the GPU) — null when no LabPBR ingestion applies.
+        final List<TextureAtlasSprite> triSprites = new ArrayList<>();
     }
 
     /** Captures the quads vanilla's model renderer emits into the current section's mesh. */
@@ -647,19 +872,12 @@ public final class RtTerrain {
             // P6.1: heuristic PBR material (roughness, metalness) for the GGX BRDF / DLSS-RR guides.
             float rough = RtMaterials.roughness(state);
             float metal = RtMaterials.metalness(state);
-            // P6.2a/b: ingest this quad's sprite's LabPBR maps into the parallel atlases and flag the prim
-            // — mat.z = 1 if an _s map exists (per-texel roughness/metalness/F0/emission), mat.w = 1 if an
-            // _n map exists (per-texel normal). Missing maps keep the heuristic / flat geometric normal.
-            float hasS = 0f;
-            float hasN = 0f;
-            if (RtMaterials.ENABLED) {
-                TextureAtlasSprite sprite = quad.materialInfo().sprite();
-                if (sprite != null) {
-                    int flags = RtBlockMaterials.INSTANCE.ensure(sprite);
-                    hasS = (flags & RtBlockMaterials.HAS_S) != 0 ? 1f : 0f;
-                    hasN = (flags & RtBlockMaterials.HAS_N) != 0 ? 1f : 0f;
-                }
-            }
+            // P6.2a/b: this quad's sprite's LabPBR maps get ingested into the parallel atlases, flagging
+            // the prim — mat.z = 1 if an _s map exists (per-texel roughness/metalness/F0/emission), mat.w
+            // = 1 if an _n map exists (per-texel normal). The ingest (RtBlockMaterials.ensure) creates GPU
+            // textures, so it's deferred to the render thread: record the sprite per triangle and write a
+            // 0 placeholder now; resolveMaterials() patches hasS/hasN before upload.
+            TextureAtlasSprite sprite = RtMaterials.ENABLED ? quad.materialInfo().sprite() : null;
 
             FloatArrayList prim = cur.prim;
             for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
@@ -673,8 +891,9 @@ public final class RtTerrain {
                 prim.add(0f);
                 prim.add(rough);
                 prim.add(metal);
-                prim.add(hasS);
-                prim.add(hasN);
+                prim.add(0f); // hasS placeholder — patched in resolveMaterials()
+                prim.add(0f); // hasN placeholder
+                cur.triSprites.add(sprite);
             }
         }
 
@@ -770,8 +989,9 @@ public final class RtTerrain {
                 prim.add(material);
                 prim.add(rough);
                 prim.add(0f); // metalness (fluids are dielectric)
-                prim.add(0f);
-                prim.add(0f);
+                prim.add(0f); // hasS (fluids carry no LabPBR atlas material)
+                prim.add(0f); // hasN
+                cur.triSprites.add(null); // keep triSprites aligned 1:1 with prim records
             }
         }
 
@@ -786,46 +1006,4 @@ public final class RtTerrain {
         @Override public VertexConsumer setLineWidth(float width) { return this; }
     }
 
-    /** Minimal {@link BlockAndTintGetter} over the client level so the model renderer can cull + tint. */
-    private record LevelView(ClientLevel level) implements BlockAndTintGetter {
-        @Override
-        public CardinalLighting cardinalLighting() {
-            return CardinalLighting.DEFAULT;
-        }
-
-        @Override
-        public int getBlockTint(BlockPos pos, ColorResolver color) {
-            return level.getBlockTint(pos, color);
-        }
-
-        @Override
-        public LevelLightEngine getLightEngine() {
-            return level.getLightEngine();
-        }
-
-        @Override
-        public BlockEntity getBlockEntity(BlockPos pos) {
-            return level.getBlockEntity(pos);
-        }
-
-        @Override
-        public BlockState getBlockState(BlockPos pos) {
-            return level.getBlockState(pos);
-        }
-
-        @Override
-        public FluidState getFluidState(BlockPos pos) {
-            return level.getFluidState(pos);
-        }
-
-        @Override
-        public int getHeight() {
-            return level.getHeight();
-        }
-
-        @Override
-        public int getMinY() {
-            return level.getMinY();
-        }
-    }
 }

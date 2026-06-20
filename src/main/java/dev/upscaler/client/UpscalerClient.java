@@ -6,6 +6,7 @@ import dev.upscaler.rt.RtDeviceBringup;
 import dev.upscaler.rt.RtComposite;
 import dev.upscaler.rt.RtEntities;
 import dev.upscaler.rt.RtTerrain;
+import dev.upscaler.rt.RtWorkerPool;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -52,6 +53,7 @@ public final class UpscalerClient implements ClientModInitializer {
 
 	private static void shutdownRt() {
 		WorldRenderScaler.INSTANCE.destroy();
+		RtWorkerPool.INSTANCE.shutdown(); // no-op if never started; stops worker threads on teardown
 		if (!rtInitDone) {
 			return;
 		}

@@ -156,7 +156,14 @@ void main() {
         payload.normal = pn;
         payload.hitT = gl_HitTEXT;
         payload.emission = 0.0;
-        payload.motionPrev = vec3(0.0); // v1: no particle MV
+        // Per-particle motion vector: interpolate the captured per-vertex displacement (uniform across the
+        // billboard's verts) with the same indices/barycentrics as the UV. dispAddr == 0 ⇒ static.
+        if (g.dispAddr != 0ul) {
+            Disps pd = Disps(g.dispAddr);
+            payload.motionPrev = pbary.x * pd.d[p0].xyz + pbary.y * pd.d[p1].xyz + pbary.z * pd.d[p2].xyz;
+        } else {
+            payload.motionPrev = vec3(0.0);
+        }
         payload.material = 2.0;          // particle marker → raygen shows-and-terminates
         payload.roughness = 1.0;
         payload.metalness = 0.0;

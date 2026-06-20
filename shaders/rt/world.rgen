@@ -323,7 +323,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
             gv_specAlb = vec3(0.0);
             gv_rough = 1.0;
             gv_hitCamRel = hitPos - pc.camOffset;
-            gv_objDisp = vec3(0.0); // v1: no particle motion vector → particles ghost under RR (deferred)
+            gv_objDisp = payload.motionPrev; // per-particle MV (P-particles MV): de-ghost moving particles
             L += throughput * payload.albedo;
             break;
         }

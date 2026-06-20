@@ -1,9 +1,14 @@
 package dev.upscaler.rt;
 
 import com.mojang.blaze3d.vertex.PoseStack;
+import dev.upscaler.mixin.ParticleEngineAccessor;
+import dev.upscaler.mixin.ParticleGroupAccessor;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.particle.Particle;
+import net.minecraft.client.particle.ParticleGroup;
+import net.minecraft.client.particle.ParticleRenderType;
 import net.minecraft.client.particle.SingleQuadParticle;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
@@ -11,9 +16,10 @@ import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
 import net.minecraft.client.renderer.entity.state.EntityRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
-import net.minecraft.client.renderer.state.level.ParticleGroupRenderState;
-import net.minecraft.client.renderer.state.level.ParticlesRenderState;
 import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
+
+import java.util.IdentityHashMap;
+import java.util.Queue;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
@@ -95,9 +101,17 @@ public final class RtEntities {
     private CameraRenderState cameraState;
 
     // Particle capture: a VertexConsumer adapter that funnels MC's billboard quads into `capture` (the
-    // shared entity mesh), plus a reused render state we self-extract into each frame.
+    // shared entity mesh). We extract each live particle into `particleScratch`, accumulate per-vertex
+    // motion-vector displacements in `particleDisp`, and key the previous-frame center off particle
+    // identity in `particlePrev` (rebuilt each frame → prunes dead particles).
     private final RtParticleCapture particleCapture = new RtParticleCapture(capture);
-    private ParticlesRenderState particleState;
+    private final QuadParticleRenderState particleScratch = new QuadParticleRenderState();
+    private final it.unimi.dsi.fastutil.floats.FloatArrayList particleDisp = new it.unimi.dsi.fastutil.floats.FloatArrayList();
+    private IdentityHashMap<Particle, ParticlePrev> particlePrev = new IdentityHashMap<>();
+
+    /** Previous frame's particle center (rebase-space) + that frame's rebase origin, for the MV diff. */
+    private record ParticlePrev(float cx, float cy, float cz, int rbx, int rby, int rbz) {
+    }
 
     private RtBuffer[] tableRing;
     private int tableSlot;
@@ -221,7 +235,7 @@ public final class RtEntities {
         FrameBuild build = new FrameBuild(base);
         captureEntities(ctx, build, mc, level, partial, rbx, rby, rbz);
         captureBlockEntities(ctx, build, mc, level, partial, rbx, rby, rbz);
-        captureParticles(ctx, build, mc, partial, rbx, rby, rbz, camX, camY, camZ, projection, viewRotation);
+        captureParticles(ctx, build, mc, partial, rbx, rby, rbz, projection, viewRotation);
         evictStaleAccels();
         evictStaleBes();
 
@@ -323,16 +337,17 @@ public final class RtEntities {
     }
 
     /**
-     * Capture this frame's billboard particles as ONE combined mesh + BLAS (cutout, unlit, camera-only).
-     * Self-extracts via {@code ParticleEngine.extract} (mirrors how entities self-extract) with the live
-     * camera + a frustum from our frame matrices, then funnels each {@link QuadParticleRenderState} layer's
-     * quads through {@link #particleCapture} into the shared {@code capture}. Per-layer texture slot comes
-     * from the layer's atlas (block/item/particle) via the bindless registry. One {@code PARTICLE_BIT}
-     * instance with mask {@link #PARTICLE_MASK} (primary-ray only). No motion vector in v1 (ghosts under RR).
+     * Capture this frame's billboard particles as ONE combined mesh + BLAS (cutout, unlit, camera-only),
+     * with per-particle motion vectors. We iterate the LIVE {@code Particle} objects (via accessor mixins)
+     * rather than the public packed render state, because only the live objects carry stable identity —
+     * needed to diff each particle's center against last frame for the MV. Each particle is extracted into
+     * {@link #particleScratch} (its billboard quad), funneled through {@link #particleCapture} into the
+     * shared {@code capture}, and its quad center cached by identity in {@link #particlePrev}. Per-layer
+     * texture slot comes from the layer's atlas (block/item/particle) via the bindless registry. One
+     * {@code PARTICLE_BIT} instance with mask {@link #PARTICLE_MASK} (primary-ray only).
      */
     private void captureParticles(RtContext ctx, FrameBuild build, Minecraft mc, float partial,
-                                  int rbx, int rby, int rbz, double camX, double camY, double camZ,
-                                  Matrix4f projection, Matrix4f viewRotation) {
+                                  int rbx, int rby, int rbz, Matrix4f projection, Matrix4f viewRotation) {
         if (!PARTICLES_ENABLED || build.full()) {
             return;
         }
@@ -340,37 +355,99 @@ public final class RtEntities {
         if (cam == null) {
             return;
         }
-        if (particleState == null) {
-            particleState = new ParticlesRenderState();
-        }
-        particleState.reset();
-        Frustum frustum = new Frustum(viewRotation, projection);
-        frustum.prepare(camX, camY, camZ);
-        try {
-            mc.particleEngine.extract(particleState, frustum, cam, partial);
-        } catch (Throwable t) {
-            return; // non-fatal: skip particles this frame if extraction throws
-        }
-        if (particleState.particles.isEmpty()) {
+        Map<ParticleRenderType, ParticleGroup<?>> groups =
+                ((ParticleEngineAccessor) mc.particleEngine).upscaler$getParticleGroups();
+        if (groups == null || groups.isEmpty()) {
             return;
         }
         capture.reset();
+        particleDisp.clear();
         // extract() emits camera-relative positions; shift them into rebased space (identity instance).
-        particleCapture.setOffset((float) (camX - rbx), (float) (camY - rby), (float) (camZ - rbz));
-        for (ParticleGroupRenderState group : particleState.particles) {
-            if (!(group instanceof QuadParticleRenderState quads)) {
-                continue; // item-pickup / elder-guardian groups aren't billboard quads (skip for v1)
+        Vec3 camPos = cam.position();
+        particleCapture.setOffset((float) (camPos.x - rbx), (float) (camPos.y - rby), (float) (camPos.z - rbz));
+        // Frustum-cull on the particle center (matches vanilla's extractRenderState): we iterate ALL live
+        // particles for identity, so cull the off-screen ones out of the BVH after capturing each.
+        Frustum frustum = new Frustum(viewRotation, projection);
+        frustum.prepare(camPos.x, camPos.y, camPos.z);
+        IdentityHashMap<Particle, ParticlePrev> cur = new IdentityHashMap<>();
+        try {
+            for (ParticleGroup<?> group : groups.values()) {
+                Queue<? extends Particle> queue = ((ParticleGroupAccessor) group).upscaler$getParticles();
+                for (Particle p : queue) {
+                    if (!(p instanceof SingleQuadParticle sq)) {
+                        continue; // item-pickup / elder-guardian particles aren't billboard quads (skip)
+                    }
+                    int vb = capture.verts.size(), ib = capture.idx.size();
+                    int ub = capture.uvList.size(), prb = capture.prim.size();
+                    int vertBefore = vb / 3;
+                    particleScratch.clear();
+                    sq.extract(particleScratch, cam, partial);
+                    for (SingleQuadParticle.Layer layer : particleScratch.layers()) {
+                        capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(layer.textureAtlasLocation());
+                        particleScratch.buildLayer(layer, particleCapture);
+                        particleCapture.flush();
+                    }
+                    int vertAfter = capture.verts.size() / 3;
+                    if (vertAfter == vertBefore) {
+                        continue; // nothing captured for this particle
+                    }
+                    float[] center = particleCenter(vertBefore, vertAfter);
+                    // pointInFrustum wants the world position: rebased center + rebase origin.
+                    if (!frustum.pointInFrustum(center[0] + rbx, center[1] + rby, center[2] + rbz)) {
+                        capture.verts.size(vb); // off-screen → truncate this particle back out (clean quad boundary)
+                        capture.idx.size(ib);
+                        capture.uvList.size(ub);
+                        capture.prim.size(prb);
+                        continue;
+                    }
+                    appendParticleMv(p, center, vertBefore, vertAfter, rbx, rby, rbz, cur);
+                }
             }
-            for (SingleQuadParticle.Layer layer : quads.layers()) {
-                capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(layer.textureAtlasLocation());
-                quads.buildLayer(layer, particleCapture);
-                particleCapture.flush(); // emit the layer's last buffered vertex
-            }
+        } catch (Throwable t) {
+            capture.reset(); // a mid-capture throw could leave a partial quad — drop particles this frame
+            particleDisp.clear();
+            return;
         }
+        particlePrev = cur;
         if (capture.isEmpty()) {
             return;
         }
-        appendCapture(ctx, build, null, -1, PARTICLE_BIT, PARTICLE_MASK); // one combined mesh, no MV (v1)
+        float[] disp = java.util.Arrays.copyOf(particleDisp.elements(), particleDisp.size());
+        appendCapture(ctx, build, disp, -1, PARTICLE_BIT, PARTICLE_MASK); // one combined mesh, per-particle MV
+    }
+
+    /** Average (rebase-space) position of a captured particle's verts — approximates the particle center. */
+    private float[] particleCenter(int vertBefore, int vertAfter) {
+        float[] v = capture.verts.elements();
+        float cx = 0f, cy = 0f, cz = 0f;
+        for (int i = vertBefore; i < vertAfter; i++) {
+            cx += v[i * 3];
+            cy += v[i * 3 + 1];
+            cz += v[i * 3 + 2];
+        }
+        int vc = vertAfter - vertBefore;
+        return new float[]{cx / vc, cy / vc, cz / vc};
+    }
+
+    /**
+     * Compute one particle's motion-vector displacement (its quad center vs. last frame's, keyed by
+     * identity) and write it for each of the particle's vertices into {@link #particleDisp}. All four
+     * billboard verts share the center displacement (per-particle-rigid MV).
+     */
+    private void appendParticleMv(Particle p, float[] center, int vertBefore, int vertAfter,
+                                  int rbx, int rby, int rbz, IdentityHashMap<Particle, ParticlePrev> cur) {
+        ParticlePrev prev = particlePrev.get(p);
+        // World displacement = (curCenter − prevCenter) + (rebaseCur − rebasePrev). New particle ⇒ 0 (no MV).
+        float dx = prev == null ? 0f : (center[0] - prev.cx()) + (rbx - prev.rbx());
+        float dy = prev == null ? 0f : (center[1] - prev.cy()) + (rby - prev.rby());
+        float dz = prev == null ? 0f : (center[2] - prev.cz()) + (rbz - prev.rbz());
+        for (int i = vertBefore; i < vertAfter; i++) {
+            particleDisp.add(dx);
+            particleDisp.add(dy);
+            particleDisp.add(dz);
+            particleDisp.add(0f);
+        }
+        cur.put(p, new ParticlePrev(center[0], center[1], center[2], rbx, rby, rbz));
     }
 
     /**

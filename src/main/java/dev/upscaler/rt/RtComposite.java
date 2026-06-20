@@ -107,6 +107,14 @@ public final class RtComposite {
     }
 
     private RtPipeline worldPipeline;
+    // Set at the HEAD of Minecraft.reloadResourcePacks() (mixin): a resource reload recreates the block
+    // atlas + entity textures. We tear down the world pipeline there (drops all descriptor references) and
+    // rebuild it once the NEW atlas is in place — detected by the atlas view handle changing away from
+    // boundAtlasHandle to a fresh non-zero value (MC's deferred free keeps the old handle live for a few
+    // frames, so "handle != 0" alone isn't enough to tell old from new).
+    private volatile boolean reloadRebindRequested;
+    // The block-atlas view handle currently bound into the world pipeline (set by bindWorldTextures).
+    private long boundAtlasHandle;
     // P6.4: the world push data (256 B) is uploaded to a host-visible BDA ring instead of inline push
     // constants, which were maxed at the 256-byte NVIDIA ceiling. Only the 8-byte slot address is pushed
     // now (see WorldPushRef in the world shaders). One slot per in-flight frame, cycled per frame so an
@@ -200,6 +208,17 @@ public final class RtComposite {
             if (displayPipeline == null) {
                 displayPipeline = RtDisplayPipeline.create(ctx);
             }
+            // A resource reload re-stitches the block atlas. We've already torn down the world pipeline
+            // (onResourceReloadStart) so nothing references the old atlas, but MC's deferred free keeps the
+            // old view handle live for a few frames, then swaps in the new atlas (whose GPU upload may lag,
+            // leaving the handle 0 transiently). Skip RT — vanilla renders — until the handle becomes a
+            // fresh, non-zero value different from what we last bound; only then rebuild against it.
+            if (reloadRebindRequested) {
+                long atlas = blockAtlasView();
+                if (atlas == 0L || atlas == boundAtlasHandle) {
+                    return false;
+                }
+            }
             ensureOutput(ctx, width, height);
             RtPipeline active = ensureWorld(ctx);
             updateMotion();
@@ -233,29 +252,66 @@ public final class RtComposite {
                 worldPipeline.setStorageImage(output.view);
                 bindGuideImages();
             }
-            worldPipeline.setAtlasSampler(blockAtlasView(), atlasSampler(ctx));
-            // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
-            // resolved samples something defined rather than an unbound (partially-bound) descriptor.
-            RtEntityTextures.INSTANCE.reset();
-            worldPipeline.setBindlessTexture(0, blockAtlasView(), atlasSampler(ctx));
-            // P6.2a/b: LabPBR _s + _n parallel atlases. Bind the (block-atlas-sized) atlases once; their
-            // pixels are filled lazily as terrain extraction encounters sprites and refreshed via flush().
-            // Fall back to the block atlas view if an atlas didn't initialize, so bindings 8/9 always hold
-            // a valid descriptor — the shader only samples them when a prim is flagged (mat.z/mat.w),
-            // which can't happen unless the atlas exists, so the fallback content is never read.
-            if (RtMaterials.ENABLED) {
-                RtBlockMaterials.INSTANCE.reset();
-                long sampler = atlasSampler(ctx);
-                long fallback = blockAtlasView();
-                long specView = RtBlockMaterials.INSTANCE.viewS();
-                long normalView = RtBlockMaterials.INSTANCE.viewN();
-                worldPipeline.setBlockSpecAtlas(specView != 0L ? specView : fallback, sampler);
-                worldPipeline.setBlockNormalAtlas(normalView != 0L ? normalView : fallback, sampler);
-            }
+            bindWorldTextures(ctx);
+            reloadRebindRequested = false;
         }
         // The TLAS is no longer bound here — it's rebuilt and bound per frame in recordFrame (P5.1a),
         // since dynamic content (entities, P5.1b) animates the instance set every frame.
         return worldPipeline;
+    }
+
+    /**
+     * Resolve + bind every world-pipeline texture: the block atlas (binding 2 + bindless fallback slot 0)
+     * and the LabPBR {@code _s}/{@code _n} parallel atlases (bindings 8/9). Shared by first creation and
+     * the post-reload rebind. Resets the entity bindless registry and recreates the {@code _s}/{@code _n}
+     * atlases at the current block-atlas size, then re-extracts all terrain ({@link RtTerrain#markAllDirty})
+     * so per-prim material flags are recomputed against the (re)built atlases. That re-extraction also
+     * fills PBR for sections built before the atlases existed — the world-join case (terrain becomes
+     * resident, hence this pipeline is created, only after the first sections upload with flags = 0).
+     */
+    private void bindWorldTextures(RtContext ctx) {
+        long sampler = atlasSampler(ctx);
+        long atlasView = blockAtlasView();
+        boundAtlasHandle = atlasView; // remember what we bound so a reload can detect the new atlas
+        worldPipeline.setAtlasSampler(atlasView, sampler);
+        // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
+        // resolved samples something defined rather than an unbound (partially-bound) descriptor.
+        RtEntityTextures.INSTANCE.reset();
+        worldPipeline.setBindlessTexture(0, atlasView, sampler);
+        // P6.2a/b: LabPBR _s + _n parallel atlases. Bind the (block-atlas-sized) atlases; their pixels
+        // fill lazily as terrain extraction encounters sprites and refresh via flush(). Fall back to the
+        // block atlas view if an atlas didn't initialize, so bindings 8/9 always hold a valid descriptor —
+        // the shader only samples them when a prim is flagged (mat.z/mat.w), which can't happen unless the
+        // atlas exists, so the fallback content is never read.
+        if (RtMaterials.ENABLED) {
+            RtBlockMaterials.INSTANCE.reset();
+            long specView = RtBlockMaterials.INSTANCE.viewS();
+            long normalView = RtBlockMaterials.INSTANCE.viewN();
+            worldPipeline.setBlockSpecAtlas(specView != 0L ? specView : atlasView, sampler);
+            worldPipeline.setBlockNormalAtlas(normalView != 0L ? normalView : atlasView, sampler);
+        }
+        RtTerrain.markAllDirty();
+    }
+
+    /**
+     * Hooked at the HEAD of {@link net.minecraft.client.Minecraft#reloadResourcePacks()} (mixin). A
+     * resource reload re-stitches the block atlas (and reloads entity textures): MC frees the old GPU
+     * images via its deferred destruction queue, which refuses while any descriptor set still references
+     * them ("in use by VkDescriptorSet" → device lost). So we drain in-flight frames and then <b>destroy
+     * the world pipeline outright</b> — dropping every descriptor reference (block atlas binding 2 +
+     * bindless set) — so MC can free its textures cleanly. The pipeline is cheap to rebuild (no terrain
+     * re-upload); {@code ensureWorld} recreates it on the first world frame after the reload, once the new
+     * atlas is ready (gated in {@link #composite}). Terrain stays resident and is re-extracted via
+     * {@code markAllDirty()} so material flags pick up the new pack.
+     */
+    public void onResourceReloadStart() {
+        reloadRebindRequested = true;
+        RtContext ctx = RtContext.currentOrNull();
+        if (ctx != null && worldPipeline != null) {
+            ctx.waitIdle();
+            worldPipeline.destroy();
+            worldPipeline = null;
+        }
     }
 
     /** Bind the three guide buffers into the world pipeline's extra storage-image slots (0..2). */

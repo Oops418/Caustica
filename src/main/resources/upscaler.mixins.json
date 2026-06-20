@@ -9,6 +9,7 @@
 		"GpuDeviceAccessor",
 		"LevelRendererMixin",
 		"LevelExtractorMixin",
+		"MinecraftReloadMixin",
 		"ParticleEngineAccessor",
 		"ParticleGroupAccessor",
 		"VulkanBackendMixin",

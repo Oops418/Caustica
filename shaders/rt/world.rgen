@@ -67,7 +67,7 @@ WorldPush pc; // populated from the BDA buffer at the top of main()
 // is deterministic (no AA jitter yet), so every SPP sample's bounce 0 yields identical values.
 vec3 gv_normal;
 vec3 gv_albedo;
-vec3 gv_specAlb; // P6.1: specular albedo (F0) fed to DLSS-RR for specular demodulation (0 = pure diffuse).
+vec3 gv_specAlb; // P6.1: specular albedo fed to DLSS-RR for specular demodulation (0 = pure diffuse).
 float gv_rough;
 float gv_specHitDistance;
 // Linear VIEW-SPACE depth (perpendicular distance from the camera plane), computed in main() from
@@ -221,6 +221,16 @@ float fresnelDielectric(float cosI, float etaI, float etaT) {
     float rs = (etaI * cosI - etaT * cosT) / (etaI * cosI + etaT * cosT);
     float rp = (etaI * cosT - etaT * cosI) / (etaI * cosT + etaT * cosI);
     return 0.5 * (rs * rs + rp * rp);
+}
+
+vec3 rrWaterSpecularAlbedo(float cosI, float rough, bool exitingWater) {
+    cosI = clamp(cosI, 0.0, 1.0);
+    if (exitingWater) {
+        // Underwater views can hit total internal reflection at the water-air boundary. The guide must
+        // follow the exact dielectric Fresnel term here; F0/integrated air-side approximations stay too dark.
+        return vec3(fresnelDielectric(cosI, WATER_IOR, 1.0));
+    }
+    return rrSpecularAlbedo(WATER_F0, rough * rough, cosI);
 }
 
 // PCG hash RNG.
@@ -382,18 +392,18 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
         // duplicated FluidRenderer back-faces don't confuse the orientation; the normal `n` already
         // faces the incoming ray. The bounce cap bounds stacked refractions.
         if (payload.material > 0.5) {
+            float cosI = clamp(dot(-rd, n), 0.0, 1.0);
             if (bounce == 0) { // primary water hit: feed RR a smooth dielectric specular surface
-                // P6.1: no diffuse albedo (clear water), specular albedo = water F0, low roughness.
-                // This is the RR-water fix — RR now demodulates water as a specular surface and resolves
-                // the reflection/refraction stably instead of shimmering it as noisy diffuse at 1 spp.
+                // P6.1: no diffuse albedo (clear water), low roughness, and side-aware specular albedo.
+                // Underwater water-air hits can be total internal reflection, so this guide uses the same
+                // dielectric Fresnel orientation as the path instead of a fixed air-side F0 approximation.
                 gv_normal = n;
                 gv_albedo = vec3(0.0);
                 gv_rough = max(MIN_ROUGH, payload.roughness);
-                gv_specAlb = rrSpecularAlbedo(WATER_F0, gv_rough * gv_rough, dot(n, -rd));
+                gv_specAlb = rrWaterSpecularAlbedo(cosI, gv_rough, inWater);
                 gv_hitCamRel = hitPos - pc.camOffset;
                 gv_objDisp = vec3(0.0); // water surface is static (no per-object MV)
             }
-            float cosI = clamp(dot(-rd, n), 0.0, 1.0);
             float etaI = inWater ? WATER_IOR : 1.0;
             float etaT = inWater ? 1.0 : WATER_IOR;
             float F = fresnelDielectric(cosI, etaI, etaT);
@@ -560,7 +570,7 @@ void main() {
     imageStore(gNormal, pix, vec4(gv_normal, gv_rough));
     imageStore(gAlbedo, pix, vec4(gv_albedo, 1.0));
     imageStore(gDepth, pix, vec4(gv_depth, 0.0, 0.0, 0.0));
-    imageStore(gSpecAlbedo, pix, vec4(gv_specAlb, 1.0)); // P6.1: specular albedo (F0) for RR demodulation
+    imageStore(gSpecAlbedo, pix, vec4(gv_specAlb, 1.0)); // P6.1: specular albedo for RR demodulation
     gv_specHitDistance = specularHitDistance(gv_hitCamRel + pc.camOffset, dir);
     imageStore(gSpecHitDistance, pix, vec4(gv_specHitDistance, 0.0, 0.0, 0.0));
 
@@ -590,7 +600,7 @@ void main() {
         } else if (pc.debugView == 4u) {
             dbg = vec3(gv_rough);                   // roughness
         } else if (pc.debugView == 6u) {
-            dbg = gv_specAlb;                       // specular albedo (F0)
+            dbg = gv_specAlb;                       // specular albedo
         } else if (pc.debugView == 7u) {
             dbg = vec3(min(gv_specHitDistance / 64.0, 1.0)); // reflection hit distance
         } else {

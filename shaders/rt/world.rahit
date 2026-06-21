@@ -20,6 +20,8 @@ struct Section {
     uint64_t primAddr;
     uint64_t idxAddr;
     uint64_t uvAddr;
+    uint opaqueTris; // any-hit opt: geom 0 (opaque) triangle count; the any-hit only runs for geom 1 (alpha)
+    uint pad;
 };
 struct EntityGeom {
     uint64_t primAddr;
@@ -85,12 +87,16 @@ void main() {
     }
 
     Section sec = SectionTable(pc.tableAddr).s[gl_InstanceCustomIndexEXT];
+    // Any-hit opt: the opaque geometry (geom 0) is flagged OPAQUE, so this shader only ever runs for the
+    // alpha geometry (geom 1) on terrain. gl_PrimitiveID restarts at 0 per geometry, so re-add the opaque
+    // triangle count to index this section's packed (opaque-first) prim/index/uv arrays.
+    uint tri = gl_PrimitiveID + (gl_GeometryIndexEXT == 1u ? sec.opaqueTris : 0u);
 
     // P5.2 water (per-prim tint.w == 1): a dielectric resolved in the closest-hit, so it must NOT be
     // alpha-cutout-discarded here. Accept it for path rays (closest-hit does the Fresnel reflect/refract),
     // but pass light through for shadow/visibility rays (SkipClosestHit set) so submerged terrain still
     // receives direct sun rather than a hard water shadow.
-    if (Prims(sec.primAddr).p[pid].tint.w > 0.5) {
+    if (Prims(sec.primAddr).p[tri].tint.w > 0.5) {
         if ((gl_IncomingRayFlagsEXT & gl_RayFlagsSkipClosestHitShaderEXT) != 0u) {
             ignoreIntersectionEXT;
         }
@@ -99,9 +105,9 @@ void main() {
 
     Indices indices = Indices(sec.idxAddr);
     UVs uvs = UVs(sec.uvAddr);
-    uint i0 = indices.i[3u * pid + 0u];
-    uint i1 = indices.i[3u * pid + 1u];
-    uint i2 = indices.i[3u * pid + 2u];
+    uint i0 = indices.i[3u * tri + 0u];
+    uint i1 = indices.i[3u * tri + 1u];
+    uint i2 = indices.i[3u * tri + 2u];
     vec2 uv = bary.x * uvs.uv[i0] + bary.y * uvs.uv[i1] + bary.z * uvs.uv[i2];
 
     if (textureLod(blockAtlas, uv, 0.0).a < ALPHA_CUTOFF) {

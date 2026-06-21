@@ -100,9 +100,25 @@ public final class RtAccel {
         // BUILD. Set for the entity refit path; false for terrain + pooled block entities.
         private final boolean updatable;
         private final boolean update;
+        // Terrain two-geometry split (any-hit opt): geom 0 = opaque blocks (VK_GEOMETRY_OPAQUE_BIT, so the
+        // driver skips world.rahit entirely) and geom 1 = alpha-tested cutout + water (NO_DUPLICATE_ANY_HIT).
+        // Both geometries share this BLAS's vertex + index buffers; the alpha geom's triangles start at
+        // primitiveOffset = opaqueTriangleCount in the shared index buffer, and gl_PrimitiveID restarts at 0
+        // per geometry (the hit shaders re-add opaqueTriangleCount for geom 1 — see the section table).
+        // terrainSplit == false ⇒ the single-geometry path (entities / pooled / refit) keyed on triangleCount.
+        private final boolean terrainSplit;
+        private final int opaqueTriangleCount;
+        private final int alphaTriangleCount;
 
         private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer pooledBacking, long vertexAddr, long indexAddr,
                              int maxVertex, int triangleCount, boolean opaque, String label, boolean updatable, boolean update) {
+            this(accel, scratch, pooledBacking, vertexAddr, indexAddr, maxVertex, triangleCount, opaque, label,
+                    updatable, update, false, 0, 0);
+        }
+
+        private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer pooledBacking, long vertexAddr, long indexAddr,
+                             int maxVertex, int triangleCount, boolean opaque, String label, boolean updatable, boolean update,
+                             boolean terrainSplit, int opaqueTriangleCount, int alphaTriangleCount) {
             this.accel = accel;
             this.scratch = scratch;
             this.pooledBacking = pooledBacking;
@@ -114,6 +130,18 @@ public final class RtAccel {
             this.label = label;
             this.updatable = updatable;
             this.update = update;
+            this.terrainSplit = terrainSplit;
+            this.opaqueTriangleCount = opaqueTriangleCount;
+            this.alphaTriangleCount = alphaTriangleCount;
+        }
+
+        /** A terrain section BLAS split into an opaque geom (any-hit skipped) + an alpha geom (cutout/water).
+         *  Either count may be 0 (the empty geom is omitted); the remaining geom is then geometry index 0. */
+        static PreparedBlas terrain(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr, int maxVertex,
+                                    int opaqueTriangleCount, int alphaTriangleCount, String label) {
+            return new PreparedBlas(accel, scratch, null, vertexAddr, indexAddr, maxVertex,
+                    opaqueTriangleCount + alphaTriangleCount, false, label, false, false,
+                    true, opaqueTriangleCount, alphaTriangleCount);
         }
     }
 
@@ -146,6 +174,31 @@ public final class RtAccel {
             RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), true, debugLabel);
             return new PreparedBlas(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
                     indexCount / 3, opaque, debugLabel, false, false);
+        }
+    }
+
+    /**
+     * Allocate a terrain section BLAS split into two geometries (any-hit opt): {@code opaqueTris} solid
+     * triangles flagged {@code OPAQUE} (so the driver never invokes {@code world.rahit} for them — the bulk
+     * of every scene) followed by {@code alphaTris} alpha-tested triangles (cutout foliage/glass + water)
+     * that keep the any-hit. Both geometries reference the SAME packed vertex/index buffers; the opaque
+     * triangles must occupy index range {@code [0, opaqueTris)} and the alpha triangles the remainder. Build
+     * is deferred to {@link #recordBlasBuilds}. Either count may be 0 (collapses to a single geometry).
+     */
+    public static PreparedBlas prepareTerrainBlas(RtContext ctx, RtBuffer positions, int vertexCount,
+                                                  RtBuffer indices, int opaqueTris, int alphaTris, String label) {
+        VkDevice vk = ctx.vk();
+        String debugLabel = labelOr(label, "terrain BLAS");
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryTerrainBlasSizes(vk, stack, positions, indices,
+                    vertexCount, opaqueTris, alphaTris);
+            RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
+                    debugLabel + " backing");
+            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                    debugLabel + " build scratch");
+            RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), true, debugLabel);
+            return PreparedBlas.terrain(accel, scratch, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
+                    opaqueTris, alphaTris, debugLabel);
         }
     }
 
@@ -283,6 +336,11 @@ public final class RtAccel {
 
     private static VkAccelerationStructureGeometryKHR.Buffer triangleGeometry(MemoryStack stack, long vertexAddr, long indexAddr, int vertexCount, boolean opaque) {
         VkAccelerationStructureGeometryKHR.Buffer geom = VkAccelerationStructureGeometryKHR.calloc(1, stack);
+        fillTriangleGeometry(geom.get(0), vertexAddr, indexAddr, vertexCount, opaque);
+        return geom;
+    }
+
+    private static void fillTriangleGeometry(VkAccelerationStructureGeometryKHR geom, long vertexAddr, long indexAddr, int vertexCount, boolean opaque) {
         geom.sType$Default().geometryType(VK_GEOMETRY_TYPE_TRIANGLES_KHR)
                 .flags(opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR);
         var tri = geom.geometry().triangles();
@@ -291,7 +349,58 @@ public final class RtAccel {
                 .maxVertex(vertexCount - 1).indexType(VK10.VK_INDEX_TYPE_UINT32);
         tri.vertexData().deviceAddress(vertexAddr);
         tri.indexData().deviceAddress(indexAddr);
+    }
+
+    /** The 1-or-2 triangle geometries of a terrain split: opaque geom first (when non-empty), then the
+     *  alpha geom. Both reference the same vertex/index buffers — the alpha geom's triangle range is
+     *  selected by the build range's {@code primitiveOffset} (see {@link #terrainBuildRanges}). */
+    private static VkAccelerationStructureGeometryKHR.Buffer terrainGeometries(MemoryStack stack, long vertexAddr,
+                                                                               long indexAddr, int vertexCount, int opaqueTris, int alphaTris) {
+        VkAccelerationStructureGeometryKHR.Buffer geom = VkAccelerationStructureGeometryKHR.calloc(splitGeomCount(opaqueTris, alphaTris), stack);
+        int g = 0;
+        if (opaqueTris > 0) {
+            fillTriangleGeometry(geom.get(g++), vertexAddr, indexAddr, vertexCount, true);
+        }
+        if (alphaTris > 0) {
+            fillTriangleGeometry(geom.get(g), vertexAddr, indexAddr, vertexCount, false);
+        }
         return geom;
+    }
+
+    /** Build ranges parallel to {@link #terrainGeometries}: the opaque geom covers indices {@code [0,
+     *  opaqueTris)} and the alpha geom the remainder, starting at byte offset {@code opaqueTris * 3 *
+     *  Integer.BYTES} into the shared index buffer. */
+    private static VkAccelerationStructureBuildRangeInfoKHR.Buffer terrainBuildRanges(MemoryStack stack, int opaqueTris, int alphaTris) {
+        VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(splitGeomCount(opaqueTris, alphaTris), stack);
+        int g = 0;
+        if (opaqueTris > 0) {
+            range.get(g++).primitiveCount(opaqueTris).primitiveOffset(0).firstVertex(0).transformOffset(0);
+        }
+        if (alphaTris > 0) {
+            range.get(g).primitiveCount(alphaTris).primitiveOffset(opaqueTris * 3 * Integer.BYTES).firstVertex(0).transformOffset(0);
+        }
+        return range;
+    }
+
+    private static int splitGeomCount(int opaqueTris, int alphaTris) {
+        return (opaqueTris > 0 ? 1 : 0) + (alphaTris > 0 ? 1 : 0);
+    }
+
+    private static VkAccelerationStructureBuildSizesInfoKHR queryTerrainBlasSizes(VkDevice vk, MemoryStack stack, RtBuffer positions,
+                                                                                  RtBuffer indices, int vertexCount, int opaqueTris, int alphaTris) {
+        VkAccelerationStructureGeometryKHR.Buffer geom = terrainGeometries(stack, positions.deviceAddress, indices.deviceAddress,
+                vertexCount, opaqueTris, alphaTris);
+        VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
+        build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                .flags(buildFlags(false))
+                .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(geom.capacity()).pGeometries(geom);
+        java.nio.IntBuffer maxPrims = (opaqueTris > 0 && alphaTris > 0)
+                ? stack.ints(opaqueTris, alphaTris)
+                : stack.ints(opaqueTris > 0 ? opaqueTris : alphaTris);
+        VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
+        vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                build.get(0), maxPrims, sizes);
+        return sizes;
     }
 
     /**
@@ -445,6 +554,10 @@ public final class RtAccel {
     }
 
     private static void recordBlasBuild(VkCommandBuffer cmd, MemoryStack stack, PreparedBlas b) {
+        if (b.terrainSplit) {
+            recordTerrainBlasBuild(cmd, stack, b);
+            return;
+        }
         VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, b.vertexAddr, b.indexAddr, b.maxVertex + 1, b.opaque);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
@@ -460,6 +573,23 @@ public final class RtAccel {
         build.get(0).scratchData().deviceAddress(b.scratch.deviceAddress);
         VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
         range.get(0).primitiveCount(b.triangleCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
+        PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
+        vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRange);
+    }
+
+    /** Record a terrain section's two-geometry (opaque + alpha) BUILD. Always a fresh BUILD — terrain
+     *  sections are never refit in place (re-extraction allocates a new BLAS), so no UPDATE branch. */
+    private static void recordTerrainBlasBuild(VkCommandBuffer cmd, MemoryStack stack, PreparedBlas b) {
+        VkAccelerationStructureGeometryKHR.Buffer geom = terrainGeometries(stack, b.vertexAddr, b.indexAddr,
+                b.maxVertex + 1, b.opaqueTriangleCount, b.alphaTriangleCount);
+        VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
+        build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                .flags(buildFlags(false))
+                .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
+                .geometryCount(geom.capacity()).pGeometries(geom)
+                .dstAccelerationStructure(b.accel.handle);
+        build.get(0).scratchData().deviceAddress(b.scratch.deviceAddress);
+        VkAccelerationStructureBuildRangeInfoKHR.Buffer range = terrainBuildRanges(stack, b.opaqueTriangleCount, b.alphaTriangleCount);
         PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
         vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRange);
     }

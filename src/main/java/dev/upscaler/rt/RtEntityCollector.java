@@ -69,9 +69,15 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // the ModelPart 0..1 UVs into the sprite's region. Mobs use a full texture (sprite == null).
         if (sprite != null) {
             capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation());
+            capture.currentHasS = false; // atlas-sourced (block-entity sprites) have no per-type _n/_s
+            capture.currentHasN = false;
             capture.setUvRemap(sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1());
         } else {
-            capture.currentTexSlot = RtEntityTextures.INSTANCE.slotFor(renderType);
+            // Mobs use a per-type texture — pick up its LabPBR _n/_s presence for the prim flags (P6.2c).
+            int slot = RtEntityTextures.INSTANCE.slotFor(renderType);
+            capture.currentTexSlot = slot;
+            capture.currentHasS = RtEntityTextures.INSTANCE.slotHasSpec(slot);
+            capture.currentHasN = RtEntityTextures.INSTANCE.slotHasNormal(slot);
             capture.clearUvRemap();
         }
         // Pose the model from its render state (idempotent re-pose; mirrors what the renderer does for
@@ -100,6 +106,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         capture.currentTexSlot = sprite != null
                 ? RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation())
                 : 0;
+        capture.currentHasS = false; // baked quads (items) are atlas-sourced — no per-type _n/_s
+        capture.currentHasN = false;
         capture.addBakedQuad(pose, q, tintColor(q.materialInfo().tintIndex(), tintLayers));
     }
 
@@ -158,6 +166,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             @Override
             public void put(float x, float y, float z, BakedQuad quad, QuadInstance instance) {
                 capture.currentTexSlot = slot;
+                capture.currentHasS = false; // block-atlas sourced — no per-type _n/_s
+                capture.currentHasN = false;
                 capture.addBakedQuad(pose, quad, -1); // white tint (falling blocks rarely biome-tinted)
             }
         };

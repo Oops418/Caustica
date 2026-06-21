@@ -29,6 +29,10 @@ public final class RtEntityCapture implements VertexConsumer {
     // collector per submitModel, so body + feature layers get their own texture). Stored per-prim in
     // tint.w; the hit shader samples entityTex[texSlot].
     int currentTexSlot;
+    // P6.2c: whether the current submission's bindless slot has a LabPBR _s / _n map (→ prim mat.z/mat.w).
+    // Set by the collector per submission; mobs (per-type textures) may have them, atlas-sourced quads don't.
+    boolean currentHasS;
+    boolean currentHasN;
     // P5.1b-2f: when a model textures from an atlas SPRITE (block entities: chests/signs/beds via a
     // Material), its ModelPart UVs are 0..1 in a virtual texture and must be remapped into the sprite's
     // atlas region — the work vanilla's sprite-coordinate-expander VertexConsumer does, which we bypass.
@@ -51,6 +55,8 @@ public final class RtEntityCapture implements VertexConsumer {
         prim.clear();
         n = 0;
         currentTexSlot = 0;
+        currentHasS = false;
+        currentHasN = false;
         uvRemap = false;
     }
 
@@ -163,8 +169,8 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot (P5.1b-2b)
             prim.add(RtMaterials.ENTITY_ROUGH); // P6.1: entities default to a matte dielectric
             prim.add(0f);                       // metalness
-            prim.add(0f);
-            prim.add(0f);
+            prim.add(currentHasS ? 1f : 0f);    // mat.z: LabPBR _s present (P6.2c)
+            prim.add(currentHasN ? 1f : 0f);    // mat.w: LabPBR _n present (P6.2c)
         }
     }
 

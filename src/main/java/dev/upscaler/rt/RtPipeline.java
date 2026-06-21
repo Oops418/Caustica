@@ -54,6 +54,8 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupH
  */
 public final class RtPipeline {
     private static final String SHADER_DIR = "/upscaler/rt/";
+    /** P6.2c: bindless entity-texture channels per slot — binding 0 = albedo, 1 = LabPBR _n, 2 = _s. */
+    public static final int BINDLESS_BINDINGS = 3;
     // A ring of descriptor sets: setTlas writes the next slot (long-unused) rather than mutating the
     // slot in-flight frames are still reading, so the TLAS can be swapped without a device drain.
     // P5.1a rebuilds + rebinds the TLAS EVERY frame (dynamic content), so a slot is reused every RING
@@ -187,20 +189,27 @@ public final class RtPipeline {
             // combined-image-sampler array the closest-hit samples per-prim for entity textures.
             long bindlessLayout = 0L, bindlessPool = 0L, bindlessSet = 0L;
             if (bindlessTextures > 0) {
-                VkDescriptorSetLayoutBinding.Buffer bl = VkDescriptorSetLayoutBinding.calloc(1, stack);
+                // P6.2c: BINDLESS_BINDINGS parallel arrays per slot — binding 0 = albedo, 1 = LabPBR _n,
+                // 2 = LabPBR _s. The closest-hit samples all three at the same slot (tint.w) for entities.
+                int nb = BINDLESS_BINDINGS;
+                VkDescriptorSetLayoutBinding.Buffer bl = VkDescriptorSetLayoutBinding.calloc(nb, stack);
                 // Sampled by the closest-hit (shading) and, for entity cutout, the any-hit (alpha test).
                 int bindlessStages = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | (hasAhit ? VK_SHADER_STAGE_ANY_HIT_BIT_KHR : 0);
-                bl.get(0).binding(0).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                        .descriptorCount(bindlessTextures).stageFlags(bindlessStages);
+                java.nio.IntBuffer bindFlags = stack.mallocInt(nb);
+                for (int b = 0; b < nb; b++) {
+                    bl.get(b).binding(b).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                            .descriptorCount(bindlessTextures).stageFlags(bindlessStages);
+                    bindFlags.put(b, VK12.VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK12.VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT);
+                }
                 VkDescriptorSetLayoutBindingFlagsCreateInfo bf = VkDescriptorSetLayoutBindingFlagsCreateInfo.calloc(stack).sType$Default()
-                        .pBindingFlags(stack.ints(VK12.VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK12.VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT));
+                        .pBindingFlags(bindFlags);
                 VkDescriptorSetLayoutCreateInfo bdslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default()
                         .pNext(bf.address()).flags(VK12.VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT).pBindings(bl);
                 check(VK10.vkCreateDescriptorSetLayout(vk, bdslci, null, p), "vkCreateDescriptorSetLayout(bindless)");
                 bindlessLayout = p.get(0);
                 RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, bindlessLayout, label + " bindless descriptor set layout");
                 VkDescriptorPoolSize.Buffer bps = VkDescriptorPoolSize.calloc(1, stack);
-                bps.get(0).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(bindlessTextures);
+                bps.get(0).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(bindlessTextures * nb);
                 VkDescriptorPoolCreateInfo bdpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
                         .flags(VK12.VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT).maxSets(1).pPoolSizes(bps);
                 check(VK10.vkCreateDescriptorPool(vk, bdpci, null, p), "vkCreateDescriptorPool(bindless)");
@@ -399,14 +408,15 @@ public final class RtPipeline {
         }
     }
 
-    /** Write an entity texture into bindless slot {@code slot} (set 1, binding 0). Update-after-bind +
-     *  append-only, so this is safe to call mid-frame for a newly-registered slot before it's sampled. */
-    public void setBindlessTexture(int slot, long imageView, long sampler) {
+    /** Write an entity texture into bindless {@code binding} (0 = albedo, 1 = LabPBR _n, 2 = _s), slot
+     *  {@code slot} (set 1). Update-after-bind + append-only, so this is safe to call mid-frame for a
+     *  newly-registered slot before it's sampled. */
+    public void setBindlessTexture(int binding, int slot, long imageView, long sampler) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
             info.get(0).sampler(sampler).imageView(imageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
-            write.get(0).sType$Default().dstSet(bindlessSet).dstBinding(0).dstArrayElement(slot)
+            write.get(0).sType$Default().dstSet(bindlessSet).dstBinding(binding).dstArrayElement(slot)
                     .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(info);
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
         }

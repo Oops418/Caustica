@@ -301,7 +301,7 @@ public final class RtComposite {
         // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
         // resolved samples something defined rather than an unbound (partially-bound) descriptor.
         RtEntityTextures.INSTANCE.reset();
-        worldPipeline.setBindlessTexture(0, atlasView, sampler);
+        worldPipeline.setBindlessTexture(0, 0, atlasView, sampler); // binding 0 (albedo), slot 0 fallback
         // P6.2a/b: LabPBR _s + _n parallel atlases. Bind the (block-atlas-sized) atlases; their pixels
         // fill lazily as terrain extraction encounters sprites and refresh via flush(). Fall back to the
         // block atlas view if an atlas didn't initialize, so bindings 8/9 always hold a valid descriptor —

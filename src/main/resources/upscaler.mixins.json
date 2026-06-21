@@ -11,6 +11,8 @@
 		"LevelExtractorMixin",
 		"MinecraftReloadMixin",
 		"ParticleEngineAccessor",
+		"RenderSetupAccessor",
+		"RenderTypeAccessor",
 		"TextureAtlasAccessor",
 		"ParticleGroupAccessor",
 		"VulkanBackendMixin",

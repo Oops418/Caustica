@@ -54,6 +54,9 @@ layout(binding = 9, set = 0) uniform sampler2D blockNormalAtlas;
 // P5.1b-2b: bindless entity textures — a runtime-sized array indexed per-prim (tint.w) by the entity
 // hit path. Slot 0 is a fallback. Entities use per-type texture files, so each RenderType gets a slot.
 layout(binding = 0, set = 1) uniform sampler2D entityTex[];
+// P6.2c: parallel per-type LabPBR _n / _s for entities, sampled at the SAME bindless slot as the albedo.
+layout(binding = 1, set = 1) uniform sampler2D entityNormalTex[];
+layout(binding = 2, set = 1) uniform sampler2D entitySpecTex[];
 
 // P6.4: per-frame push data lives in a host-visible BDA buffer (the old inline block hit the 256-byte
 // push-constant ceiling); only its 8-byte address is pushed. The hit shaders read just two table
@@ -132,6 +135,54 @@ vec3 metalF0(int idx) {
 // path tracer already computes its own AO from sky-visibility rays (avoid double-darkening).
 const float NORMAL_AO_STRENGTH = 0.5;
 
+// LabPBR _s decode (shared by terrain + entities): red = perceptual smoothness -> roughness; green =
+// reflectance (dielectric F0 0..229 / predefined metal 230..237 / generic metal albedo); alpha = emission
+// (255 = ignored). `albedo` feeds the generic-metal F0.
+void decodeSpec(vec4 s, vec3 albedo, out float rough, out float metal, out vec3 f0, out float emission) {
+    rough = (1.0 - s.r) * (1.0 - s.r);
+    float g = s.g * 255.0;
+    if (g < 229.5) {
+        metal = 0.0;
+        f0 = vec3(s.g);
+    } else if (g < 237.5) {
+        metal = 1.0;
+        f0 = metalF0(int(g + 0.5) - 230);
+    } else {
+        metal = 1.0;
+        f0 = albedo;
+    }
+    float a = s.a * 255.0;
+    emission = a < 254.5 ? a / 254.0 : 0.0;
+}
+
+// LabPBR _n decode (shared): rotate the tangent-space normal into world space via a TBN built from the hit
+// triangle's vertex positions (VK_KHR_ray_tracing_position_fetch) + UVs. `n` must already be oriented
+// toward the viewer (`vdir`). Clamps the result above the horizon so grazing perturbations don't invert it
+// through the surface (the black-spot fix). Returns AO (blue) via `ao`; falls back to `n` on a degenerate
+// UV triangle. Instance transforms are translation-only, so object edges equal world edges.
+vec3 perturbNormal(vec3 n, vec3 p0, vec3 p1, vec3 p2, vec2 t0, vec2 t1, vec2 t2, vec3 vdir, vec4 ntex, out float ao) {
+    ao = 1.0;
+    vec2 g1 = t1 - t0;
+    vec2 g2 = t2 - t0;
+    float det = g1.x * g2.y - g1.y * g2.x;
+    if (abs(det) <= 1.0e-12) {
+        return n;
+    }
+    float r = 1.0 / det;
+    vec3 traw = ((p1 - p0) * g2.y - (p2 - p0) * g1.y) * r;
+    vec3 T = normalize(traw - n * dot(n, traw));       // Gram-Schmidt against the viewer-oriented normal
+    vec3 B = cross(n, T) * (det < 0.0 ? -1.0 : 1.0);   // handedness from the UV winding
+    vec2 nxy = ntex.xy * 2.0 - 1.0;                    // R,G = tangent-space X,Y
+    float nz = sqrt(max(0.0, 1.0 - dot(nxy, nxy)));    // reconstruct Z
+    vec3 nm = normalize(nxy.x * T + nxy.y * B + nz * n);
+    float NoV = dot(nm, vdir);
+    if (NoV < 0.02) {
+        nm = normalize(nm + vdir * (0.02 - NoV));      // keep above the horizon (no flip)
+    }
+    ao = mix(1.0, ntex.b, NORMAL_AO_STRENGTH);
+    return nm;
+}
+
 void main() {
     // Particle billboard: same geom-table/UV/bindless-atlas path as entities, but unlit — albedo =
     // atlas texel * per-particle colour (tint.rgb), tagged material 2 so the raygen shows it and stops
@@ -175,9 +226,12 @@ void main() {
         int eidx = gl_InstanceCustomIndexEXT & ~ENTITY_BIT;
         EntityGeom g = EntityTable(pc.entityTableAddr).e[eidx];
         Prim pr = Prims(g.primAddr).p[gl_PrimitiveID];
+        // Orient the geometric normal toward the viewer first (so the _n TBN is built in the right
+        // hemisphere — same fix as terrain).
+        vec3 vdir = -gl_WorldRayDirectionEXT;
         vec3 n = normalize(pr.normal.xyz);
-        if (dot(n, gl_WorldRayDirectionEXT) > 0.0) {
-            n = -n; // orient toward the viewer, like the terrain path below
+        if (dot(n, vdir) < 0.0) {
+            n = -n;
         }
         // Interpolate the captured entity-texture UV (same scheme as terrain) and sample the bindless
         // per-type texture; tint.rgb is the model colour multiplier (white for most, tinted for sheep/etc.).
@@ -189,10 +243,27 @@ void main() {
         vec3 ebary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
         vec2 euvCoord = ebary.x * euv.uv[e0] + ebary.y * euv.uv[e1] + ebary.z * euv.uv[e2];
         int texSlot = int(pr.tint.w + 0.5);
-        payload.albedo = texture(entityTex[nonuniformEXT(texSlot)], euvCoord).rgb * pr.tint.rgb;
+
+        vec3 albedo = texture(entityTex[nonuniformEXT(texSlot)], euvCoord).rgb * pr.tint.rgb;
+        float rough = pr.mat.x;          // P6.1 heuristic defaults
+        float metal = pr.mat.y;
+        vec3 f0 = mix(vec3(0.04), albedo, metal);
+        float emission = 0.0;
+        float ao = 1.0;
+        // P6.2c LabPBR _s / _n for entities — per-type bindless arrays sampled at the same slot as albedo.
+        if (pr.mat.z > 0.5) {
+            decodeSpec(texture(entitySpecTex[nonuniformEXT(texSlot)], euvCoord), albedo, rough, metal, f0, emission);
+        }
+        if (pr.mat.w > 0.5) {
+            n = perturbNormal(n, gl_HitTriangleVertexPositionsEXT[0], gl_HitTriangleVertexPositionsEXT[1],
+                    gl_HitTriangleVertexPositionsEXT[2], euv.uv[e0], euv.uv[e1], euv.uv[e2], vdir,
+                    texture(entityNormalTex[nonuniformEXT(texSlot)], euvCoord), ao);
+        }
+
+        payload.albedo = albedo * ao;
         payload.normal = n;
         payload.hitT = gl_HitTEXT;
-        payload.emission = 0.0;
+        payload.emission = emission;
         // P5.1c-2: per-vertex motion vector — interpolate the captured per-vertex displacement with the
         // same indices/barycentrics used for the UV above. Rotation and skeletal/lid animation use a
         // per-vertex buffer; pure whole-object translation is packed into rigidDisp with no buffer.
@@ -203,9 +274,9 @@ void main() {
             payload.motionPrev = g.rigidDisp.xyz;
         }
         payload.material = 0.0;          // entities are opaque
-        payload.roughness = pr.mat.x;    // P6.1
-        payload.metalness = pr.mat.y;
-        payload.f0 = mix(vec3(0.04), payload.albedo, pr.mat.y); // entity F0 (dielectric / metal)
+        payload.roughness = rough;
+        payload.metalness = metal;
+        payload.f0 = f0;
         return;
     }
 
@@ -232,40 +303,12 @@ void main() {
         n = -n;
     }
 
-    // P6.2b LabPBR normal map (_n), gated by mat.w. Build a TBN from the hit triangle's vertex positions
-    // (VK_KHR_ray_tracing_position_fetch) + UVs and rotate the tangent-space normal into world space.
-    // Instance transforms are translation-only, so object-space edges equal world-space — no normal-matrix
-    // transform needed.
+    // P6.2b LabPBR normal map (_n), gated by mat.w — shared decode (TBN from position-fetch + UVs).
     float ao = 1.0;
     if (pr.mat.w > 0.5) {
-        vec3 p0 = gl_HitTriangleVertexPositionsEXT[0];
-        vec3 p1 = gl_HitTriangleVertexPositionsEXT[1];
-        vec3 p2 = gl_HitTriangleVertexPositionsEXT[2];
-        vec3 e1 = p1 - p0;
-        vec3 e2 = p2 - p0;
-        vec2 g1 = uvs.uv[i1] - uvs.uv[i0];
-        vec2 g2 = uvs.uv[i2] - uvs.uv[i0];
-        float det = g1.x * g2.y - g1.y * g2.x;
-        if (abs(det) > 1.0e-12) {
-            float r = 1.0 / det;
-            vec3 traw = (e1 * g2.y - e2 * g1.y) * r;
-            vec3 T = normalize(traw - n * dot(n, traw));       // Gram-Schmidt against the viewer-oriented normal
-            vec3 B = cross(n, T) * (det < 0.0 ? -1.0 : 1.0);   // handedness from the UV winding
-            vec4 ntex = textureLod(blockNormalAtlas, uv, 0.0);
-            vec2 nxy = ntex.xy * 2.0 - 1.0;                    // R,G = tangent-space X,Y
-            float nz = sqrt(max(0.0, 1.0 - dot(nxy, nxy)));    // reconstruct Z
-            vec3 nm = normalize(nxy.x * T + nxy.y * B + nz * n);
-            // Keep the shading normal in the viewer hemisphere — at grazing angles a strong perturbation
-            // can tip it below the horizon (N·V < 0), which reads as black spots / light leaking to the
-            // back face. Project it back onto the horizon (+ a small bias) instead of flipping it.
-            float NoV = dot(nm, vdir);
-            const float NV_MIN = 0.02;
-            if (NoV < NV_MIN) {
-                nm = normalize(nm + vdir * (NV_MIN - NoV));
-            }
-            n = nm;
-            ao = mix(1.0, ntex.b, NORMAL_AO_STRENGTH);         // blue = ambient occlusion
-        }
+        n = perturbNormal(n, gl_HitTriangleVertexPositionsEXT[0], gl_HitTriangleVertexPositionsEXT[1],
+                gl_HitTriangleVertexPositionsEXT[2], uvs.uv[i0], uvs.uv[i1], uvs.uv[i2], vdir,
+                textureLod(blockNormalAtlas, uv, 0.0), ao);
     }
 
     payload.albedo = textureLod(blockAtlas, uv, 0.0).rgb * tint * ao;
@@ -279,25 +322,11 @@ void main() {
     float metal = pr.mat.y;
     vec3 f0 = mix(vec3(0.04), payload.albedo, metal);
     float emission = pr.normal.w;   // 0..1 block light level (extraction): the heuristic emission source
+    // P6.2a LabPBR _s, gated by mat.z — shared decode. When an _s map is authored we trust ITS emission and
+    // REPLACE the block-light heuristic, so emissive texels come from the pack, not the light level.
+    // (blue channel: porosity 0..64 / SSS 65..255 — deferred, not consumed yet.)
     if (pr.mat.z > 0.5) {
-        vec4 s = textureLod(blockSpecAtlas, uv, 0.0);
-        rough = (1.0 - s.r) * (1.0 - s.r);          // red = perceptual smoothness -> roughness
-        float g = s.g * 255.0;                      // green = reflectance / metal index
-        if (g < 229.5) {                            // 0..229: dielectric, linear F0 = green/255
-            metal = 0.0;
-            f0 = vec3(s.g);
-        } else if (g < 237.5) {                     // 230..237: predefined metal (N/K table)
-            metal = 1.0;
-            f0 = metalF0(int(g + 0.5) - 230);
-        } else {                                    // 238..255: generic metal, albedo as F0
-            metal = 1.0;
-            f0 = payload.albedo;
-        }
-        // Alpha = LabPBR emission (255 = ignored). When an _s map is authored we trust ITS emission and
-        // REPLACE the block-light heuristic — so emissive texels come from the pack, not the light level.
-        float a = s.a * 255.0;
-        emission = a < 254.5 ? a / 254.0 : 0.0;
-        // (blue channel: porosity 0..64 / SSS 65..255 — deferred, not consumed yet.)
+        decodeSpec(textureLod(blockSpecAtlas, uv, 0.0), payload.albedo, rough, metal, f0, emission);
     }
     payload.roughness = rough;
     payload.metalness = metal;

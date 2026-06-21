@@ -292,13 +292,16 @@ void main() {
     vec3 n = normalize(pr.normal.xyz);
     vec3 tint = pr.tint.rgb;
 
-    Indices indices = Indices(sec.idxAddr);
+    // Lever B: per-triangle corner UVs in primitive order. uvs.uv[3*pid + k] is a contiguous,
+    // directly-addressed load (no index buffer, no scattered vertex-UV gather), so it issues as soon as
+    // pid is known and its latency overlaps the prim fetch instead of serialising behind an index load.
+    // The index buffer still exists for the BLAS build; the shading path just no longer reads it.
     UVs uvs = UVs(sec.uvAddr);
-    uint i0 = indices.i[3u * pid + 0u];
-    uint i1 = indices.i[3u * pid + 1u];
-    uint i2 = indices.i[3u * pid + 2u];
+    vec2 uv0 = uvs.uv[3u * pid + 0u];
+    vec2 uv1 = uvs.uv[3u * pid + 1u];
+    vec2 uv2 = uvs.uv[3u * pid + 2u];
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
-    vec2 uv = bary.x * uvs.uv[i0] + bary.y * uvs.uv[i1] + bary.z * uvs.uv[i2];
+    vec2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
 
     // Orient the GEOMETRIC normal toward the viewer FIRST (double-sided geometry), so the normal-map TBN
     // is built in the correct hemisphere. Doing this before the map — rather than flipping the perturbed
@@ -313,7 +316,7 @@ void main() {
     float ao = 1.0;
     if (pr.mat.w > 0.5) {
         n = perturbNormal(n, gl_HitTriangleVertexPositionsEXT[0], gl_HitTriangleVertexPositionsEXT[1],
-                gl_HitTriangleVertexPositionsEXT[2], uvs.uv[i0], uvs.uv[i1], uvs.uv[i2], vdir,
+                gl_HitTriangleVertexPositionsEXT[2], uv0, uv1, uv2, vdir,
                 textureLod(blockNormalAtlas, uv, 0.0), ao);
     }
 

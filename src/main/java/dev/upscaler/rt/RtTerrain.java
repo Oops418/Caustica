@@ -545,7 +545,7 @@ public final class RtTerrain {
             resolveMaterials(buckets[b]);
             vertFloats += buckets[b].verts.size();
             idxCount += buckets[b].idx.size();
-            uvFloats += buckets[b].uvList.size();
+            uvFloats += buckets[b].cornerUv.size();
             primFloats += buckets[b].prim.size();
             bucketTris[b] = buckets[b].triCount();
         }
@@ -583,7 +583,9 @@ public final class RtTerrain {
             for (int i = 0, n = geom.idx.size(); i < n; i++) {
                 idx.put(gi[i] + vertBase);
             }
-            uv.put(geom.uvList.elements(), 0, geom.uvList.size());
+            // Corner UVs are primitive-order (6 floats/tri), so unlike the index buffer they are NOT
+            // rebased — pid = gl_PrimitiveID + triBase[g] addresses them across the concatenated buckets.
+            uv.put(geom.cornerUv.elements(), 0, geom.cornerUv.size());
             mat.put(geom.prim.elements(), 0, geom.prim.size());
             triBase[g] = triAcc;
             if (b == RtAccel.BUCKET_WATER) {
@@ -645,8 +647,7 @@ public final class RtTerrain {
         int nullSpriteMicroTriangles = 0;
         int animatedTris = 0;
         int nullSpriteTris = 0;
-        int[] indices = cutout.idx.elements();
-        float[] uvs = cutout.uvList.elements();
+        float[] cornerUv = cutout.cornerUv.elements();
         for (int t = 0; t < triCount; t++) {
             TextureAtlasSprite sprite = cutout.ommSprites.get(t);
             if (sprite == null) {
@@ -664,7 +665,7 @@ public final class RtTerrain {
             if (sprite.isAnimated()) {
                 animatedTris++;
             }
-            OmmTriangleResult result = classifyTriangleCached(level, bytesPerTriangle, sprite, indices, uvs, t);
+            OmmTriangleResult result = classifyTriangleCached(level, bytesPerTriangle, sprite, cornerUv, t);
             System.arraycopy(result.data(), 0, data, t * bytesPerTriangle, bytesPerTriangle);
             OmmMicroCounts counts = result.counts();
             opaqueMicroTriangles += counts.opaque();
@@ -771,12 +772,10 @@ public final class RtTerrain {
     }
 
     private static OmmTriangleResult classifyTriangleCached(int level, int bytesPerTriangle, TextureAtlasSprite sprite,
-                                                            int[] indices, float[] uvs, int tri) {
-        int uv0 = indices[tri * 3] * 2;
-        int uv1 = indices[tri * 3 + 1] * 2;
-        int uv2 = indices[tri * 3 + 2] * 2;
+                                                            float[] cornerUv, int tri) {
+        int o = tri * 6; // 6 floats/triangle: (u0,v0, u1,v1, u2,v2) in primitive order
         OmmTriangleKey key = new OmmTriangleKey(sprite, level,
-                uvs[uv0], uvs[uv0 + 1], uvs[uv1], uvs[uv1 + 1], uvs[uv2], uvs[uv2 + 1]);
+                cornerUv[o], cornerUv[o + 1], cornerUv[o + 2], cornerUv[o + 3], cornerUv[o + 4], cornerUv[o + 5]);
         return OMM_TRIANGLE_CACHE.computeIfAbsent(key, k -> classifyTriangle(level, bytesPerTriangle, k.sprite(),
                 k.u0(), k.v0(), k.u1(), k.v1(), k.u2(), k.v2()));
     }
@@ -1367,7 +1366,10 @@ public final class RtTerrain {
     private static final class Geom {
         final FloatArrayList verts = new FloatArrayList();
         final IntArrayList idx = new IntArrayList();
-        final FloatArrayList uvList = new FloatArrayList(); // 2 floats/vertex: atlas UV
+        // Lever B: per-triangle corner UVs in primitive order — 6 floats/triangle (3 corners x u,v),
+        // aligned with `idx`'s triangle order so the hit shader reads cornerUv[3*pid + k] directly with no
+        // index->vertex-UV gather. The index buffer is still emitted (above) for the BLAS build.
+        final FloatArrayList cornerUv = new FloatArrayList();
         final FloatArrayList prim = new FloatArrayList();   // 12 floats/triangle: normal.xyz+emission, tint.rgb+material, mat.{rough,metal,hasS,hasN}
         // One sprite per prim record (per triangle), aligned with `prim`. Resolved to hasS/hasN on the
         // render thread (RtBlockMaterials.ensure touches the GPU) — null when no LabPBR ingestion applies.
@@ -1411,16 +1413,17 @@ public final class RtTerrain {
             addVertex(g, p1, x, y, z);
             addVertex(g, p2, x, y, z);
             addVertex(g, p3, x, y, z);
-            addUv(g, quad.packedUV(0));
-            addUv(g, quad.packedUV(1));
-            addUv(g, quad.packedUV(2));
-            addUv(g, quad.packedUV(3));
             idx.add(base);
             idx.add(base + 1);
             idx.add(base + 2);
             idx.add(base);
             idx.add(base + 2);
             idx.add(base + 3);
+            // Per-triangle corner UVs (primitive order, matching the two triangles emitted above:
+            // 0,1,2 then 0,2,3) so the hit shader reads cornerUv[3*pid + k] without an index gather.
+            long pu0 = quad.packedUV(0), pu1 = quad.packedUV(1), pu2 = quad.packedUV(2), pu3 = quad.packedUV(3);
+            addTriUv(g, pu0, pu1, pu2);
+            addTriUv(g, pu0, pu2, pu3);
 
             float ex1 = p1.x() - p0.x(), ey1 = p1.y() - p0.y(), ez1 = p1.z() - p0.z();
             float ex2 = p2.x() - p0.x(), ey2 = p2.y() - p0.y(), ez2 = p2.z() - p0.z();
@@ -1487,12 +1490,29 @@ public final class RtTerrain {
             g.verts.add(p.y() + y);
             g.verts.add(p.z() + z);
         }
+    }
 
-        private void addUv(Geom g, long packedUV) {
-            // UVPair packs u in the high 32 bits, v in the low 32 (atlas-space, no sprite remap needed).
-            g.uvList.add(Float.intBitsToFloat((int) (packedUV >>> 32)));
-            g.uvList.add(Float.intBitsToFloat((int) packedUV));
-        }
+    /** Append one triangle's 3 corner UVs (6 floats) from packed UVPairs. UVPair packs u in the high 32
+     *  bits, v in the low 32 (atlas-space, no sprite remap needed). */
+    private static void addTriUv(Geom g, long pa, long pb, long pc) {
+        FloatArrayList c = g.cornerUv;
+        c.add(Float.intBitsToFloat((int) (pa >>> 32)));
+        c.add(Float.intBitsToFloat((int) pa));
+        c.add(Float.intBitsToFloat((int) (pb >>> 32)));
+        c.add(Float.intBitsToFloat((int) pb));
+        c.add(Float.intBitsToFloat((int) (pc >>> 32)));
+        c.add(Float.intBitsToFloat((int) pc));
+    }
+
+    /** Append one triangle's 3 corner UVs (6 floats) from float u,v pairs (fluid path). */
+    private static void addTriUv(Geom g, float ua, float va, float ub, float vb, float uc, float vc) {
+        FloatArrayList c = g.cornerUv;
+        c.add(ua);
+        c.add(va);
+        c.add(ub);
+        c.add(vb);
+        c.add(uc);
+        c.add(vc);
     }
 
     /**
@@ -1542,8 +1562,6 @@ public final class RtTerrain {
                 verts.add(qx[i]);
                 verts.add(qy[i]);
                 verts.add(qz[i]);
-                g.uvList.add(qu[i]);
-                g.uvList.add(qv[i]);
             }
             idx.add(base);
             idx.add(base + 1);
@@ -1551,6 +1569,9 @@ public final class RtTerrain {
             idx.add(base);
             idx.add(base + 2);
             idx.add(base + 3);
+            // Per-triangle corner UVs (primitive order: 0,1,2 then 0,2,3), matching the two triangles above.
+            addTriUv(g, qu[0], qv[0], qu[1], qv[1], qu[2], qv[2]);
+            addTriUv(g, qu[0], qv[0], qu[2], qv[2], qu[3], qv[3]);
 
             float ex1 = qx[1] - qx[0], ey1 = qy[1] - qy[0], ez1 = qz[1] - qz[0];
             float ex2 = qx[2] - qx[0], ey2 = qy[2] - qy[0], ez2 = qz[2] - qz[0];

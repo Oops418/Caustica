@@ -103,12 +103,10 @@ void main() {
     // Cutout geometry: alpha-test the atlas. gl_PrimitiveID restarts at 0 per geometry, so re-add this
     // geometry's triangle base to index the section's packed index/uv arrays.
     uint tri = gl_PrimitiveID + sec.triBase[gl_GeometryIndexEXT];
-    Indices indices = Indices(sec.idxAddr);
+    // Lever B: per-triangle corner UVs in primitive order (see world.rchit) — a contiguous, directly
+    // addressed load, no index buffer, no scattered vertex-UV gather.
     UVs uvs = UVs(sec.uvAddr);
-    uint i0 = indices.i[3u * tri + 0u];
-    uint i1 = indices.i[3u * tri + 1u];
-    uint i2 = indices.i[3u * tri + 2u];
-    vec2 uv = bary.x * uvs.uv[i0] + bary.y * uvs.uv[i1] + bary.z * uvs.uv[i2];
+    vec2 uv = bary.x * uvs.uv[3u * tri + 0u] + bary.y * uvs.uv[3u * tri + 1u] + bary.z * uvs.uv[3u * tri + 2u];
 
     if (textureLod(blockAtlas, uv, 0.0).a < ALPHA_CUTOFF) {
         ignoreIntersectionEXT;

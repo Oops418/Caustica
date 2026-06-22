@@ -66,10 +66,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class RtTerrain {
     public static final boolean ENABLED = Boolean.parseBoolean(System.getProperty("upscaler.rt.terrain", "true"));
-    // RT view distance in chunks: explicit override, else min(vanilla render distance, cap). RT is
-    // costly, so it's capped below typical raster view distance and tunable.
-    private static final int VIEW_CHUNKS = Integer.getInteger("upscaler.rt.viewChunks", 0);
-    private static final int VIEW_CHUNKS_CAP = Integer.getInteger("upscaler.rt.viewChunksCap", 8);
     private static final int VIEW_SECTIONS_V = Integer.getInteger("upscaler.rt.viewSectionsV", 6);
     private static final int SECTIONS_PER_TICK = Integer.getInteger("upscaler.rt.sectionsPerTick", 24);
     // Async terrain: tessellate sections on RtWorkerPool instead of inline on the render thread. The
@@ -418,13 +414,9 @@ public final class RtTerrain {
      * until every neighbour is present makes the first build correct.
      *
      * <p>We deliberately gate on <em>all</em> neighbours, not just those inside the RT view window. A
-     * section at the window edge has an outward neighbour that is out of window (so not ray-traced) but
-     * whose chunk is still loaded — the RT view is capped well below the vanilla render distance — so we
-     * can read its blocks and bake a correct border. Without this, the edge section would mesh against
-     * air, then show a seam once the player moves and that neighbour becomes interior and is rendered.
-     * The only cost is at the very view edge when the render distance is at or below the RT cap: the
-     * outermost ring waits for a chunk that is never loaded, leaving it unbuilt — an acceptable nit far
-     * from the player.
+     * section at the window edge can have an outward neighbour that is outside the current vanilla-loaded
+     * area. Without this, the edge section would mesh against air, then show a seam once the player moves
+     * and that neighbour becomes interior and is rendered.
      */
     private boolean neighborChunksReady(ClientLevel level, int scx, int scz) {
         for (int dx = -1; dx <= 1; dx++) {
@@ -441,8 +433,7 @@ public final class RtTerrain {
     }
 
     private int horizontalChunks(Minecraft mc) {
-        int r = VIEW_CHUNKS > 0 ? VIEW_CHUNKS : Math.min(mc.options.getEffectiveRenderDistance(), VIEW_CHUNKS_CAP);
-        return Math.max(1, r);
+        return Math.max(1, mc.options.getEffectiveRenderDistance());
     }
 
     private static int dist2(int[] s, int pcx, int psy, int pcz) {

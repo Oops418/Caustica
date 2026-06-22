@@ -352,11 +352,11 @@ vec2 previousReflectionNdc(vec3 surfacePos, vec3 surfaceNormal, vec3 reflectedWo
 
 // Reflection (specular) motion vector for DLSS-RR. Covers smooth specular blocks (metals / LabPBR _s)
 // and water reflections including underwater total-internal-reflection — any primary surface with a
-// sharp specular lobe (specular albedo > 0, roughness <= 0.75). A sky miss is treated as a reflected
+// sharp specular lobe (specular albedo > 0, roughness <= 0.5). A sky miss is treated as a reflected
 // hit at infinity along the reflected direction, so the same mirror-image reprojection handles surface
 // and sky reflections uniformly (continuous as the reflected distance -> infinity).
 vec2 specularReflectionMotion(vec3 surfacePos, vec3 primaryDir, vec2 currentNdc, vec2 size) {
-    if (length(gv_normal) < 0.5 || max(gv_specAlb.r, max(gv_specAlb.g, gv_specAlb.b)) <= 0.001 || gv_rough > 0.75) {
+    if (length(gv_normal) < 0.5 || max(gv_specAlb.r, max(gv_specAlb.g, gv_specAlb.b)) <= 0.001 || gv_rough > 0.5) {
         return vec2(0.0);
     }
 

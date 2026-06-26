@@ -2,7 +2,7 @@
 	"schemaVersion": 1,
 	"id": "upscaler",
 	"version": "${version}",
-	"name": "Sodium Upscaler",
+	"name": "Upscaler",
 	"description": "Hardware-ray-traced renderer with DLSS Ray Reconstruction for the Minecraft Vulkan backend.",
 	"authors": [
 		"i"

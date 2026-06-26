@@ -47,16 +47,7 @@ import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_STRUCTURE_TYPE_PHYSICAL_DEV
  * KHR structs are created fresh. BDA / descriptor-indexing / SPIR-V 1.4 are core on the
  * 1.4 device, so only three extension <i>names</i> are needed; the rest are feature enables.
  *
- * <p><b>Extension names vs features, and Sodium:</b> Sodium's {@code VulkanBackendMixin}
- * rewrites arg0 from its {@code DeviceExtensionRegistry} (names only — no feature API) and
- * never touches arg2. So:
- * <ul>
- *   <li>Names: added to arg0 by us standalone; registered through Sodium's registry (via
- *       {@code SodiumCompat}) when Sodium is present — see {@link #sodiumExtensionsRegistered}.</li>
- *   <li>Features: always added to arg2 by us, but <i>only</i> when the extensions are
- *       guaranteed enabled (standalone, or Sodium registration succeeded), otherwise
- *       {@code vkCreateDevice} would fail on a feature without its extension.</li>
- * </ul>
+ * <p>Extension names are added to the device extension list separately; feature structs are added here.
  * Both are gated on the selected device actually supporting RT; if not, nothing is added
  * and the device comes up exactly as vanilla. This startup capability switch is intentionally
  * independent of {@code upscaler.rt.output}: output mode is a runtime work/display toggle,
@@ -90,9 +81,6 @@ public final class RtDeviceBringup {
             Boolean.parseBoolean(System.getProperty("upscaler.rt.omm", "true"));
     public static final List<String> OPTIONAL_RT_EXTENSIONS = List.of(
             VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
-
-    /** Set by SodiumCompat once the RT extension names are registered in Sodium's registry. */
-    public static volatile boolean sodiumExtensionsRegistered = false;
 
     private static volatile boolean rtRequested;
     private static volatile boolean ommEnabled; // VK_EXT_opacity_micromap actually enabled on the device
@@ -151,10 +139,7 @@ public final class RtDeviceBringup {
         }
     }
 
-    /**
-     * Both paths: add the RT VulkanFeatures to arg2. Caller guarantees the extensions are
-     * being enabled (standalone, or Sodium registration succeeded).
-     */
+    /** Add the RT VulkanFeatures to arg2 after the matching extension names have been requested. */
     @SuppressWarnings("unchecked")
     public static void addFeatures(Args args, VulkanPhysicalDevice physicalDevice) {
         if (!ENABLED_BY_PROPERTY) {

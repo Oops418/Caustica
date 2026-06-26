@@ -24,9 +24,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * <p>We deliberately do <em>not</em> hook {@code setSectionDirty}: lighting-only invalidations
  * ({@code ClientChunkCache.onLightUpdate}) route straight through it, and we ray-trace lighting, so a
  * light change never alters our geometry. Hooking the block entry points keeps us off that churn.
- *
- * <p>These are real vanilla methods, so the injects work without Sodium (the intended config). If
- * Sodium is present it {@code @Overwrite}s the bodies, but a HEAD inject coexists with an overwrite.
  */
 @Mixin(LevelExtractor.class)
 public class LevelExtractorMixin {

@@ -17,7 +17,7 @@ public final class UpscalerClient implements ClientModInitializer {
 
 	@Override
 	public void onInitializeClient() {
-		UpscalerMod.LOGGER.info("Sodium Upscaler client initialized");
+		UpscalerMod.LOGGER.info("Upscaler client initialized");
 
 		// The GpuDevice exists well before the first tick, so a one-shot at tick start
 		// runs on the render thread with the device idle between frames.

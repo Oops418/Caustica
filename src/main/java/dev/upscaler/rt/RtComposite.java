@@ -7,7 +7,6 @@ import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
 import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
 import dev.upscaler.UpscalerMod;
-import dev.upscaler.client.SodiumCompat;
 import dev.upscaler.client.UpscalerJitter;
 import dev.upscaler.mixin.CommandEncoderAccessor;
 import net.minecraft.client.Minecraft;
@@ -887,10 +886,6 @@ public final class RtComposite {
     }
 
     private static long vkImageView(GpuTextureView view) {
-        Long sodiumHandle = SodiumCompat.vkImageView(view);
-        if (sodiumHandle != null) {
-            return sodiumHandle;
-        }
         if (view instanceof VulkanGpuTextureView vulkanView) {
             return vulkanView.vkImageView();
         }
@@ -898,10 +893,6 @@ public final class RtComposite {
     }
 
     private static long vkImage(GpuTexture texture) {
-        Long sodiumHandle = SodiumCompat.vkImage(texture);
-        if (sodiumHandle != null) {
-            return sodiumHandle;
-        }
         if (texture instanceof VulkanGpuTexture vulkanTexture) {
             return vulkanTexture.vkImage();
         }

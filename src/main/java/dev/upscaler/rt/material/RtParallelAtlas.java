@@ -4,7 +4,6 @@ import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
 import dev.upscaler.UpscalerMod;
-import dev.upscaler.client.SodiumCompat;
 import dev.upscaler.mixin.TextureAtlasAccessor;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
@@ -280,10 +279,6 @@ public final class RtParallelAtlas {
     }
 
     private static long vkImageView(GpuTextureView view) {
-        Long sodiumHandle = SodiumCompat.vkImageView(view);
-        if (sodiumHandle != null) {
-            return sodiumHandle;
-        }
         if (view instanceof VulkanGpuTextureView vulkanView) {
             return vulkanView.vkImageView();
         }

@@ -4,7 +4,6 @@ import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
 import dev.upscaler.UpscalerMod;
-import dev.upscaler.client.SodiumCompat;
 import dev.upscaler.mixin.RenderSetupAccessor;
 import dev.upscaler.mixin.RenderTypeAccessor;
 import dev.upscaler.rt.material.RtEntityMaterials;
@@ -351,10 +350,6 @@ public final class RtEntityTextures {
     }
 
     private static long vkImageView(GpuTextureView view) {
-        Long sodiumHandle = SodiumCompat.vkImageView(view);
-        if (sodiumHandle != null) {
-            return sodiumHandle;
-        }
         if (view instanceof VulkanGpuTextureView vulkanView) {
             return vulkanView.vkImageView();
         }

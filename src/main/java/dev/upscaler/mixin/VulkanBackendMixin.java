@@ -9,7 +9,6 @@ import com.mojang.blaze3d.vulkan.VulkanPhysicalDevice;
 import com.mojang.blaze3d.vulkan.init.VulkanFeature;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.RtDeviceBringup;
-import net.fabricmc.loader.api.FabricLoader;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkDevice;
@@ -30,15 +29,8 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Standalone fallback for the Vulkan device-negotiation hook: adds the device
- * extensions the FFX runtime needs to the extension list vanilla enables at
- * vkCreateDevice time.
- *
- * <p>When Sodium is present this defers entirely to Sodium's
- * {@code DeviceExtensionRegistry} (fed via {@link dev.upscaler.client.SodiumCompat}),
- * which owns device negotiation — this is the "Phase 0" layering. Both paths
- * dedupe and Sodium returns a Set, so even if both ran the result would be
- * correct; deferring just keeps a single owner.
+ * Vulkan device-negotiation hook: adds the device extensions the upscaler runtime needs to the extension
+ * list vanilla enables at vkCreateDevice time.
  *
  * <p>FFX resolves vkGetImageMemoryRequirements2KHR etc. through
  * vkGetDeviceProcAddr using the KHR-suffixed extension names; per Vulkan spec
@@ -64,13 +56,11 @@ public abstract class VulkanBackendMixin {
 			"VK_KHR_dedicated_allocation",
 			// NGX (DLSS) — NVIDIA-only; skipped on other vendors. (The NGX instance
 			// extension VK_KHR_get_physical_device_properties2 needs an instance hook;
-			// without Sodium, DLSS relies on it being core/enabled at instance level.)
+			// DLSS relies on it being core/enabled at instance level.)
 			"VK_NVX_binary_import",
 			"VK_NVX_image_view_handle",
 			"VK_KHR_push_descriptor");
 
-	private static final boolean SODIUM_OWNS_NEGOTIATION =
-			FabricLoader.getInstance().isModLoaded("sodium");
 	private static final Set<String> loggedMissingSdkFeatures = new HashSet<>();
 
 	@ModifyArgs(
@@ -79,33 +69,26 @@ public abstract class VulkanBackendMixin {
 	private void upscaler$addDeviceExtensions(Args args) {
 		VulkanPhysicalDevice physicalDevice = args.get(1);
 
-		if (!SODIUM_OWNS_NEGOTIATION) {
-			// Standalone: add the upscaler + RT extension names to arg0 ourselves.
-			Collection<String> requested = args.get(0);
-			var augmented = new ArrayList<>(requested);
-			for (String extension : UPSCALER_WANTED_EXTENSIONS) {
-				if (augmented.contains(extension)) {
-					continue;
-				}
-				if (physicalDevice.hasDeviceExtension(extension)) {
-					augmented.add(extension);
-					UpscalerMod.LOGGER.info("Enabling device extension {} for the upscaler runtime", extension);
-				} else {
-					UpscalerMod.LOGGER.warn("Device extension {} not supported by {} — upscaling will be unavailable",
-							extension, physicalDevice.deviceName());
-				}
+		Collection<String> requested = args.get(0);
+		var augmented = new ArrayList<>(requested);
+		for (String extension : UPSCALER_WANTED_EXTENSIONS) {
+			if (augmented.contains(extension)) {
+				continue;
 			}
-			RtDeviceBringup.addExtensions(augmented, physicalDevice);
-			args.set(0, augmented);
+			if (physicalDevice.hasDeviceExtension(extension)) {
+				augmented.add(extension);
+				UpscalerMod.LOGGER.info("Enabling device extension {} for the upscaler runtime", extension);
+			} else {
+				UpscalerMod.LOGGER.warn("Device extension {} not supported by {} — upscaling will be unavailable",
+						extension, physicalDevice.deviceName());
+			}
 		}
+		RtDeviceBringup.addExtensions(augmented, physicalDevice);
+		args.set(0, augmented);
 
 		upscaler$addCoreDeviceFeatures(args, physicalDevice);
 
-		// P0 — RT feature structs go in arg2, which Sodium never touches. Names are
-		// guaranteed in arg0 when standalone, or when Sodium accepted our registration.
-		if (!SODIUM_OWNS_NEGOTIATION || RtDeviceBringup.sodiumExtensionsRegistered) {
-			RtDeviceBringup.addFeatures(args, physicalDevice);
-		}
+		RtDeviceBringup.addFeatures(args, physicalDevice);
 	}
 
 	@SuppressWarnings("unchecked")

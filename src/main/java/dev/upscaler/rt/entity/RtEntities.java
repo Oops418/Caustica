@@ -829,7 +829,8 @@ public final class RtEntities {
         writeTableEntry(build, e.prim.deviceAddress, e.indices.deviceAddress, e.uvs.deviceAddress, dispAddr, 0f, 0f, 0f);
         // Block-local mesh placed by a translate-only instance transform (blockPos − rebase), like terrain.
         float[] xform = {1, 0, 0, e.bx - rbx, 0, 1, 0, e.by - rby, 0, 0, 1, e.bz - rbz};
-        build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress, ENTITY_BIT | (build.count & 0x7FFFFF)));
+        build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress,
+                ENTITY_BIT | (build.count & 0x7FFFFF), 0xFF, RtAccel.SBT_ENTITY_OFFSET));
         build.count++;
     }
 
@@ -929,7 +930,8 @@ public final class RtEntities {
         writeTableEntry(build, prim.deviceAddress, indices.deviceAddress, uvs.deviceAddress, motion.dispAddr,
                 motion.rigidX, motion.rigidY, motion.rigidZ);
 
-        build.instances.add(new RtAccel.Instance(IDENTITY, accel.deviceAddress, instanceBit | (build.count & 0x3FFFFF), mask));
+        build.instances.add(new RtAccel.Instance(IDENTITY, accel.deviceAddress,
+                instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
         build.buffers.add(positions);
         build.buffers.add(indices);
         build.buffers.add(uvs);

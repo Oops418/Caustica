@@ -71,7 +71,7 @@ import java.util.concurrent.Future;
  * tint, alpha cutout). Vertices are section-local (f32-exact); each TLAS instance carries a
  * translation {@code sectionOrigin − rebaseOrigin} (rebase = player block at the last rebuild, so
  * transforms stay small at any world coordinate) and an {@code instanceCustomIndex} into a BDA
- * section table ({@code {primAddr, idxAddr, uvAddr, triBase[3], waterGeom}} per section) the hit shaders read.
+ * section table ({@code {primAddr, idxAddr, uvAddr, triBase[4]}} per section) the hit shaders read.
  *
  * <p>Tessellation reads only an immutable snapshot ({@link RenderSectionRegion}, captured on the render
  * thread via {@link RenderRegionCache} exactly as vanilla's chunk compiler does). CPU meshing runs on
@@ -108,9 +108,7 @@ public final class RtTerrain {
         return UpscalerConfig.Rt.Terrain.MAX_INFLIGHT_SECTIONS.value();
     }
 
-    private static final int SECTION_ENTRY_BYTES = 40; // {u64 primAddr, u64 idxAddr, u64 uvAddr, u32 triBase[3], u32 waterGeom}
-    // Sentinel for "this section has no water geometry": no gl_GeometryIndexEXT (0..2) can equal it.
-    private static final int NO_WATER_GEOM = 0xFFFFFFFF;
+    private static final int SECTION_ENTRY_BYTES = 40; // {u64 primAddr, u64 idxAddr, u64 uvAddr, u32 triBase[4]}
     // Frames a retired resource must outlive before it's freed (> frames-in-flight). The frame counter
     // advances per composite; old TLAS/table/sections are freed this many frames after the swap.
     private static final int KEEP_FRAMES = 4;
@@ -233,7 +231,7 @@ public final class RtTerrain {
         return staticInstances;
     }
 
-    /** Section table device address: {@code {u64 primAddr, u64 idxAddr, u64 uvAddr, u32 triBase[3], u32 waterGeom}} per section, indexed by gl_InstanceCustomIndexEXT. */
+    /** Section table device address: {@code {u64 primAddr, u64 idxAddr, u64 uvAddr, u32 triBase[4]}} per section, indexed by gl_InstanceCustomIndexEXT. */
     public long tableAddress() {
         return sectionTable.deviceAddress;
     }
@@ -773,7 +771,7 @@ public final class RtTerrain {
     }
 
     private static PackedSection packSection(SectionMesh mesh) {
-        Geom[] buckets = mesh.buckets(); // { opaque, cutout, water }, indexed by RtAccel.BUCKET_*
+        Geom[] buckets = mesh.buckets(); // { solid, cutout, translucent, water }, indexed by RtAccel.BUCKET_*
         int vertFloats = 0, idxCount = 0, uvFloats = 0, primFloats = 0, triCount = 0;
         int[] bucketTris = new int[buckets.length];
         for (int b = 0; b < buckets.length; b++) {
@@ -791,13 +789,10 @@ public final class RtTerrain {
         float[] material = new float[primFloats];
         TextureAtlasSprite[] materialSprites = new TextureAtlasSprite[triCount];
         int[] triBase = new int[buckets.length];
-        int waterGeom = NO_WATER_GEOM;
-        int posOff = 0, idxOff = 0, uvOff = 0, matOff = 0, spriteOff = 0, vertBase = 0, triAcc = 0, g = 0;
+        int posOff = 0, idxOff = 0, uvOff = 0, matOff = 0, spriteOff = 0, vertBase = 0, triAcc = 0;
         for (int b = 0; b < buckets.length; b++) {
             Geom geom = buckets[b];
-            if (geom.idx.isEmpty()) {
-                continue; // empty bucket -> no geometry emitted; its gl_GeometryIndexEXT slot doesn't exist
-            }
+            triBase[b] = triAcc;
             int vertSize = geom.verts.size();
             System.arraycopy(geom.verts.elements(), 0, positions, posOff, vertSize);
             int idxSize = geom.idx.size();
@@ -814,10 +809,6 @@ public final class RtTerrain {
             int matSize = geom.prim.size();
             System.arraycopy(geom.prim.elements(), 0, material, matOff, matSize);
             geom.materialSprites.copyInto(materialSprites, spriteOff);
-            triBase[g] = triAcc;
-            if (b == RtAccel.BUCKET_WATER) {
-                waterGeom = g;
-            }
             posOff += vertSize;
             idxOff += idxSize;
             uvOff += uvSize;
@@ -825,9 +816,8 @@ public final class RtTerrain {
             spriteOff += bucketTris[b];
             vertBase += vertSize / 3;
             triAcc += bucketTris[b];
-            g++;
         }
-        return new PackedSection(positions, indices, uvs, material, materialSprites, bucketTris, triBase, waterGeom);
+        return new PackedSection(positions, indices, uvs, material, materialSprites, bucketTris, triBase);
     }
 
     private static SectionMesh tessellate(RenderSectionRegion region, BlockStateModelSet modelSet,
@@ -926,7 +916,7 @@ public final class RtTerrain {
         // water (shadow passthrough). Build is deferred — the caller batches all sections into one submission.
         RtAccel.PreparedBlas blas = RtAccel.prepareTerrainBlasPooled(ctx, pool, positions, vertCount, indices, packed.bucketTris(), ommInput,
                 label + " BLAS");
-        return new PreparedSection(key, positions, indices, uvs, material, blas, packed.triBase(), packed.waterGeom(), sox, soy, soz);
+        return new PreparedSection(key, positions, indices, uvs, material, blas, packed.triBase(), sox, soy, soz);
     }
 
     /** Patch packed prim records' hasS/hasN lanes via render-thread material ingestion. */
@@ -1233,7 +1223,7 @@ public final class RtTerrain {
     private void destroyPreparedSection(PreparedSection ps) {
         RtAccel.freeBlasScratch(pool, List.of(ps.blas()));
         SectionGeom g = new SectionGeom(ps.key(), ps.positions(), ps.indices(), ps.uvs(), ps.material(),
-                ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.waterGeom(), ps.sx(), ps.sy(), ps.sz());
+                ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.sx(), ps.sy(), ps.sz());
         g.destroy(pool);
     }
 
@@ -1249,12 +1239,12 @@ public final class RtTerrain {
     /** Worker-packed terrain buffer payload; upload only allocates buffers and bulk-copies these arrays. */
     private record PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
                                  TextureAtlasSprite[] materialSprites,
-                                 int[] bucketTris, int[] triBase, int waterGeom) {
+                                 int[] bucketTris, int[] triBase) {
     }
 
     /** A section tessellated + uploaded with a prepared (not-yet-built) BLAS, pending the batch build. */
     private record PreparedSection(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs, RtBuffer material,
-                                   RtAccel.PreparedBlas blas, int[] triBase, int waterGeom, int sx, int sy, int sz) {
+                                   RtAccel.PreparedBlas blas, int[] triBase, int sx, int sy, int sz) {
     }
 
     private record DirtyEvent(long groupId, LongArrayList keys) {
@@ -1366,7 +1356,7 @@ public final class RtTerrain {
         for (PreparedSection ps : prepared) {
             SectionGeom prev = resident.get(ps.key());
             SectionGeom g = new SectionGeom(ps.key(), ps.positions(), ps.indices(), ps.uvs(), ps.material(),
-                    ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.waterGeom(), ps.sx(), ps.sy(), ps.sz());
+                    ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.sx(), ps.sy(), ps.sz());
             if (prev != null && prev.slot >= 0) {
                 g.slot = prev.slot;
                 g.instanceIndex = prev.instanceIndex;
@@ -1497,7 +1487,7 @@ public final class RtTerrain {
         MemoryUtil.memPutInt(base + 24, g.triBase[0]);
         MemoryUtil.memPutInt(base + 28, g.triBase[1]);
         MemoryUtil.memPutInt(base + 32, g.triBase[2]);
-        MemoryUtil.memPutInt(base + 36, g.waterGeom);
+        MemoryUtil.memPutInt(base + 36, g.triBase[3]);
     }
 
     private static RtAccel.Instance instanceFor(SectionGeom g, int rbx, int rby, int rbz) {
@@ -1595,7 +1585,7 @@ public final class RtTerrain {
             RtAccel.freeBlasScratch(pool, pending.blas());
             for (PreparedSection ps : pending.prepared()) {
                 SectionGeom g = new SectionGeom(ps.key(), ps.positions(), ps.indices(), ps.uvs(), ps.material(),
-                        ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.waterGeom(), ps.sx(), ps.sy(), ps.sz());
+                        ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.sx(), ps.sy(), ps.sz());
                 g.destroy(pool);
             }
             for (SectionGeom g : pending.removed()) {
@@ -1669,8 +1659,7 @@ public final class RtTerrain {
         final RtBuffer material;
         final RtAccel blas;
         final RtBuffer blasBacking;
-        final int[] triBase;  // per-emitted-geometry triangle offset; hit shaders add triBase[gl_GeometryIndexEXT] to pid
-        final int waterGeom;  // gl_GeometryIndexEXT of the water geometry (NO_WATER_GEOM if none)
+        final int[] triBase;  // per-fixed-bucket triangle offset; hit shaders add triBase[gl_GeometryIndexEXT] to pid
         final int sx;
         final int sy;
         final int sz;
@@ -1678,7 +1667,7 @@ public final class RtTerrain {
         int instanceIndex = -1;
 
         SectionGeom(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs, RtBuffer material,
-                    RtAccel blas, RtBuffer blasBacking, int[] triBase, int waterGeom, int sx, int sy, int sz) {
+                    RtAccel blas, RtBuffer blasBacking, int[] triBase, int sx, int sy, int sz) {
             this.key = key;
             this.positions = positions;
             this.indices = indices;
@@ -1687,7 +1676,6 @@ public final class RtTerrain {
             this.blas = blas;
             this.blasBacking = blasBacking;
             this.triBase = triBase;
-            this.waterGeom = waterGeom;
             this.sx = sx;
             this.sy = sy;
             this.sz = sz;
@@ -1708,31 +1696,30 @@ public final class RtTerrain {
 
     /**
      * Transient CPU accumulator for one section's quads while tessellating. Split into per-material geometry
-     * buckets so the BLAS can flag the {@link #opaque} bucket (solid blocks) {@code VK_GEOMETRY_OPAQUE_BIT}
-     * — the driver then never invokes {@code world.rahit} for it, the bulk of every scene — while the
-     * {@link #cutout} bucket (alpha-tested foliage/glass) keeps the alpha-test any-hit and the {@link #water}
-     * bucket keeps a memory-free any-hit (shadow passthrough only, classified by geometry index). The buckets
-     * are concatenated in {@code BUCKET_*} order into the packed section buffers at upload, so each geometry's
-     * triangles occupy a contiguous range (see {@link RtAccel#prepareTerrainBlas} + the section table).
+     * buckets so the BLAS can flag solid blocks {@code VK_GEOMETRY_OPAQUE_BIT}, keep true alpha cutout in
+     * an any-hit bucket, and route translucent/water through closest-hit-only records for radiance but
+     * any-hit records for shadow tint/pass-through. The buckets are concatenated in {@code BUCKET_*} order
+     * into the packed section buffers at upload, so each geometry's triangles occupy a contiguous range.
      */
     private static final class SectionMesh {
         // Conservative worker-side starting capacities. These trade a little transient RAM for avoiding the
         // repeated grow/copy ladder on normal terrain sections.
         private static final int OPAQUE_TRI_CAP = 768;
         private static final int CUTOUT_TRI_CAP = 256;
+        private static final int TRANSLUCENT_TRI_CAP = 64;
         private static final int WATER_TRI_CAP = 128;
-        // One bucket per RtAccel terrain geometry, in BUCKET_SOLID / BUCKET_CUTOUT / BUCKET_WATER order.
-        // solid = opaque (any-hit skipped); cutout = alpha-tested foliage/glass; water = shadow passthrough
-        // only (no alpha test — the any-hit classifies it by geometry index, no memory load).
+        // One bucket per fixed RtAccel terrain geometry: solid, cutout, translucent, water.
         private static final Geom EMPTY_GEOM = new Geom(0);
         Geom opaque;
         Geom cutout;
+        Geom translucent;
         Geom water;
         private final Geom[] buckets = new Geom[RtAccel.TERRAIN_BUCKETS];
 
         Geom[] buckets() {
             buckets[RtAccel.BUCKET_SOLID] = geomOrEmpty(opaque);
             buckets[RtAccel.BUCKET_CUTOUT] = geomOrEmpty(cutout);
+            buckets[RtAccel.BUCKET_TRANSLUCENT] = geomOrEmpty(translucent);
             buckets[RtAccel.BUCKET_WATER] = geomOrEmpty(water);
             return buckets;
         }
@@ -1749,6 +1736,10 @@ public final class RtTerrain {
             return cutout != null ? cutout : (cutout = new Geom(CUTOUT_TRI_CAP));
         }
 
+        Geom translucent() {
+            return translucent != null ? translucent : (translucent = new Geom(TRANSLUCENT_TRI_CAP));
+        }
+
         Geom water() {
             return water != null ? water : (water = new Geom(WATER_TRI_CAP));
         }
@@ -1760,6 +1751,7 @@ public final class RtTerrain {
         boolean isEmpty() {
             return (opaque == null || opaque.idx.isEmpty())
                     && (cutout == null || cutout.idx.isEmpty())
+                    && (translucent == null || translucent.idx.isEmpty())
                     && (water == null || water.idx.isEmpty());
         }
     }
@@ -2020,7 +2012,7 @@ public final class RtTerrain {
             if (q.translucent) {
                 offset(q, -TRANSLUCENT_INSET);
             }
-            Geom g = q.cutout ? cur.cutout() : cur.opaque();
+            Geom g = q.translucent ? cur.translucent() : (q.cutout ? cur.cutout() : cur.opaque());
             int base = g.verts.size() / 3;
             for (int k = 0; k < 4; k++) {
                 g.verts.add(q.x[k]);
@@ -2054,9 +2046,7 @@ public final class RtTerrain {
                 prim.add(0f); // hasS placeholder; patched by resolveMaterials()
                 prim.add(0f); // hasN placeholder
                 g.materialSprites.add(q.materialSprite);
-                // Exclude glass from the opacity micromap (null sprite): its any-hit must run every time to
-                // resolve transmission, not be pre-classified opaque/transparent into holes.
-                g.ommSprites.add(q.translucent ? null : q.sprite);
+                g.ommSprites.add(q.sprite);
             }
         }
     }

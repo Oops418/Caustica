@@ -52,7 +52,7 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkCreateRayTracingPipelines
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupHandlesKHR;
 
 /**
- * An RT pipeline with an SBT of {raygen + N miss + one triangle hit group} and a descriptor
+ * An RT pipeline with an SBT of {raygen + N miss + triangle hit groups} and a descriptor
  * set of {binding 0 = TLAS, binding 1 = storage image}. Built from SPIR-V resources. Update the
  * bindings with {@link #setTlas}/{@link #setStorageImage}, then {@link #trace}. Reusable across
  * the triangle spike and terrain (extend the descriptor layout there as needed). Multiple miss
@@ -80,6 +80,7 @@ public final class RtPipeline {
     private final RtBuffer sbt;
     private final long sbtStride;
     private final int missCount;
+    private final int hitGroupCount;
     private final int pushConstantSize;
     private final int pushConstantStages;
     private final int firstExtraBinding;
@@ -96,7 +97,7 @@ public final class RtPipeline {
     private final int skyAtlasBinding;
     private boolean destroyed;
 
-    private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int pushConstantSize, int pushConstantStages, int firstExtraBinding,
+    private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int hitGroupCount, int pushConstantSize, int pushConstantStages, int firstExtraBinding,
                        long bindlessLayout, long bindlessPool, long bindlessSet, int specAtlasBinding, int normalAtlasBinding, int skyAtlasBinding) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
@@ -108,6 +109,7 @@ public final class RtPipeline {
         this.sbt = sbt;
         this.sbtStride = stride;
         this.missCount = missCount;
+        this.hitGroupCount = hitGroupCount;
         this.pushConstantSize = pushConstantSize;
         this.pushConstantStages = pushConstantStages;
         this.firstExtraBinding = firstExtraBinding;
@@ -120,11 +122,10 @@ public final class RtPipeline {
     }
 
     /**
-     * Builds the RT pipeline. {@code rahit} (nullable) adds an any-hit shader to the single triangle hit group for
-     * alpha-tested cutout geometry — it's an extra pipeline stage but not an extra SBT group, so the
-     * record layout is unchanged. When present, the atlas sampler and push constants are also made
-     * visible to the any-hit stage. {@code extraStorageImages} adds that many raygen-visible storage
-     * images at bindings 3.. (the DLSS-RR guide buffers);
+     * Builds the RT pipeline. {@code rahit} (nullable) adds any-hit-capable triangle hit records. With the
+     * world pipeline, the hit SBT region is laid out to match {@link RtAccel}'s terrain bucket/ray-type
+     * constants: radiance records first, shadow records second, then entity records. {@code extraStorageImages}
+     * adds that many raygen-visible storage images at bindings 3.. (the DLSS-RR guide buffers);
      * write them with {@link #setExtraStorageImage}.
      */
     public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withAtlasSampler, int extraStorageImages, int bindlessTextures, boolean blockMaterialAtlases, boolean skyAtlas) {
@@ -258,15 +259,14 @@ public final class RtPipeline {
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE_LAYOUT, layout, label + " pipeline layout");
 
             // Stages: raygen, one miss per rmiss entry, the closest-hit, then (optionally) the any-hit.
-            // The closest-hit stage index is 1 + missCount; the any-hit, if any, follows it. Groups are
-            // raygen + N miss + ONE triangle hit group (the any-hit shares that group, so it adds a
-            // stage but not a group — the SBT record count is unchanged).
+            // Groups are raygen + N miss + the hit records selected by traceRayEXT's SBT offset/stride.
             int missCount = rmiss.length;
-            int groupCount = 1 + missCount + 1;
+            int hitGroupCount = hasAhit ? RtAccel.SBT_HIT_GROUP_COUNT : 1;
+            int groupCount = 1 + missCount + hitGroupCount;
             int hitGroupIdx = 1 + missCount;
             int chitStage = 1 + missCount;
             int ahitStage = chitStage + 1;
-            int stageCount = groupCount + (hasAhit ? 1 : 0);
+            int stageCount = 1 + missCount + 1 + (hasAhit ? 1 : 0);
             long mGen = loadModule(vk, stack, rgen);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, mGen, label + " " + rgen);
             long[] mMiss = new long[missCount];
@@ -298,9 +298,12 @@ public final class RtPipeline {
                 groups.get(1 + m).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
                         .generalShader(1 + m).closestHitShader(VK_SHADER_UNUSED_KHR).anyHitShader(VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
             }
-            groups.get(hitGroupIdx).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
-                    .generalShader(VK_SHADER_UNUSED_KHR).closestHitShader(chitStage)
-                    .anyHitShader(hasAhit ? ahitStage : VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
+            for (int h = 0; h < hitGroupCount; h++) {
+                groups.get(hitGroupIdx + h).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
+                        .generalShader(VK_SHADER_UNUSED_KHR).closestHitShader(chitStage)
+                        .anyHitShader(hasAhit && hitGroupUsesAnyHit(h) ? ahitStage : VK_SHADER_UNUSED_KHR)
+                        .intersectionShader(VK_SHADER_UNUSED_KHR);
+            }
 
             VkRayTracingPipelineCreateInfoKHR.Buffer rtpci = VkRayTracingPipelineCreateInfoKHR.calloc(1, stack);
             // Depth 1: secondary shadow/visibility rays are issued sequentially from raygen (not
@@ -334,9 +337,21 @@ public final class RtPipeline {
             for (int g = 0; g < groupCount; g++) {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
-            return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, pushConstantSize, pcStages, firstExtraBinding,
+            return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, hitGroupCount, pushConstantSize, pcStages, firstExtraBinding,
                     bindlessLayout, bindlessPool, bindlessSet, specBinding, normalBinding, skyBinding);
         }
+    }
+
+    private static boolean hitGroupUsesAnyHit(int relativeHitGroup) {
+        if (relativeHitGroup < RtAccel.SBT_ENTITY_OFFSET) {
+            int rayType = relativeHitGroup / RtAccel.TERRAIN_BUCKETS;
+            int bucket = relativeHitGroup % RtAccel.TERRAIN_BUCKETS;
+            if (rayType == RtAccel.SBT_RAY_RADIANCE) {
+                return bucket == RtAccel.BUCKET_CUTOUT;
+            }
+            return bucket != RtAccel.BUCKET_SOLID;
+        }
+        return true;
     }
 
     /**
@@ -477,7 +492,7 @@ public final class RtPipeline {
             VkStridedDeviceAddressRegionKHR miss = VkStridedDeviceAddressRegionKHR.calloc(stack)
                     .deviceAddress(sbt.deviceAddress + sbtStride).stride(sbtStride).size((long) missCount * sbtStride);
             VkStridedDeviceAddressRegionKHR hit = VkStridedDeviceAddressRegionKHR.calloc(stack)
-                    .deviceAddress(sbt.deviceAddress + (1L + missCount) * sbtStride).stride(sbtStride).size(sbtStride);
+                    .deviceAddress(sbt.deviceAddress + (1L + missCount) * sbtStride).stride(sbtStride).size((long) hitGroupCount * sbtStride);
             VkStridedDeviceAddressRegionKHR callable = VkStridedDeviceAddressRegionKHR.calloc(stack);
             vkCmdTraceRaysKHR(cmd, raygen, miss, hit, callable, width, height, 1);
         }

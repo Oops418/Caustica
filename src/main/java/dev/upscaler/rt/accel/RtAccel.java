@@ -236,12 +236,10 @@ public final class RtAccel {
         private final boolean updatable;
         private final boolean update;
         // Terrain multi-geometry split (any-hit opt): one geometry per material bucket, in the fixed packed
-        // order { solid, cutout, water } (see TERRAIN_BUCKETS). Bucket 0 (solid) is flagged
-        // VK_GEOMETRY_OPAQUE_BIT so the driver skips world.rahit entirely; cutout + water keep
-        // NO_DUPLICATE_ANY_HIT (cutout alpha-tests; water only passes shadow rays through). Empty buckets are
-        // omitted, so geometry indices are compacted — the section table stores the per-geometry triangle
-        // base (gl_PrimitiveID restarts at 0 per geometry) and which geometry is water. All geometries share
-        // this BLAS's vertex + index buffers; each bucket's triangle range is selected by primitiveOffset.
+        // order { solid, cutout, translucent, water } (see TERRAIN_BUCKETS). Bucket 0 (solid) is flagged
+        // VK_GEOMETRY_OPAQUE_BIT. The fixed geometry indices are also SBT material indices: radiance rays
+        // use closest-hit-only records for solid/translucent/water and an any-hit record for true cutout;
+        // shadow rays use any-hit records for cutout/translucent/water.
         // terrainSplit == false ⇒ the single-geometry path (entities / pooled / refit) keyed on triangleCount.
         private final boolean terrainSplit;
         private final int[] terrainTris; // per-bucket triangle counts in TERRAIN_BUCKETS order (null if !terrainSplit)
@@ -272,8 +270,7 @@ public final class RtAccel {
             this.opacityMicromap = opacityMicromap;
         }
 
-        /** A terrain section BLAS split into per-bucket geometries (solid opaque, then cutout, then water),
-         *  in {@link RtAccel#TERRAIN_BUCKETS} order. Empty buckets are omitted (their geometry isn't built). */
+        /** A terrain section BLAS split into fixed per-bucket geometries in {@link RtAccel#TERRAIN_BUCKETS} order. */
         static PreparedBlas terrain(RtAccel accel, RtBuffer scratch, RtBuffer pooledBacking, long vertexAddr, long indexAddr, int maxVertex,
                                     int[] terrainTris, OpacityMicromap opacityMicromap, String label) {
             int total = 0;
@@ -305,12 +302,18 @@ public final class RtAccel {
         }
     }
 
-    /** Terrain material buckets, packed in this order into a section's geometry. Bucket 0 (solid) is the only
-     *  opaque one (any-hit skipped); cutout alpha-tests; water only passes shadow rays through. */
+    /** Terrain material buckets. Geometry indices are fixed and double as SBT material record indices. */
     public static final int BUCKET_SOLID = 0;
     public static final int BUCKET_CUTOUT = 1;
-    public static final int BUCKET_WATER = 2;
-    public static final int TERRAIN_BUCKETS = 3;
+    public static final int BUCKET_TRANSLUCENT = 2;
+    public static final int BUCKET_WATER = 3;
+    public static final int TERRAIN_BUCKETS = 4;
+    public static final int SBT_RAY_RADIANCE = 0;
+    public static final int SBT_RAY_SHADOW = 1;
+    public static final int SBT_TERRAIN_RADIANCE_OFFSET = SBT_RAY_RADIANCE * TERRAIN_BUCKETS;
+    public static final int SBT_TERRAIN_SHADOW_OFFSET = SBT_RAY_SHADOW * TERRAIN_BUCKETS;
+    public static final int SBT_ENTITY_OFFSET = TERRAIN_BUCKETS * 2;
+    public static final int SBT_HIT_GROUP_COUNT = SBT_ENTITY_OFFSET + TERRAIN_BUCKETS * 2;
 
     /**
      * Result of {@link #prepareUpdatableBlasBuild}: the per-frame BUILD op to record, plus the persistent
@@ -339,13 +342,10 @@ public final class RtAccel {
     }
 
     /**
-     * Allocate a terrain section BLAS split into one geometry per material bucket (any-hit opt). {@code
-     * bucketTris} holds the triangle count of each bucket in {@link #TERRAIN_BUCKETS} order: solid (flagged
-     * {@code OPAQUE} so the driver never invokes {@code world.rahit} for it — the bulk of every scene),
-     * cutout (alpha-tested foliage/glass), and water (shadow passthrough only). All geometries reference the
-     * SAME packed vertex/index buffers, which the caller must concatenate in bucket order so each geometry's
-     * triangles form a contiguous range. Build is deferred to {@link #recordBlasBuilds}; empty buckets are
-     * omitted (their geometry isn't built), so an all-solid section is a single opaque geometry.
+     * Allocate a terrain section BLAS split into fixed material buckets (any-hit opt). {@code bucketTris}
+     * holds triangle counts in {@link #TERRAIN_BUCKETS} order: solid, cutout, translucent, water. All
+     * geometries reference the same packed vertex/index buffers; zero-triangle buckets are kept so
+     * {@code gl_GeometryIndexEXT} remains a stable material/SBT index in the shaders.
      */
     public static PreparedBlas prepareTerrainBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                                   RtBuffer indices, int[] bucketTris, OpacityMicromapInput opacityMicromapInput,
@@ -594,14 +594,11 @@ public final class RtAccel {
         return build;
     }
 
-    /** One triangle geometry per non-empty bucket, in {@link #TERRAIN_BUCKETS} order; only bucket
-     *  {@link #BUCKET_SOLID} is flagged opaque. All geometries reference the same vertex/index buffers — each
-     *  bucket's triangle range is selected by the build range's {@code primitiveOffset} (see
-     *  {@link #terrainBuildRanges}). */
+    /** One triangle geometry per bucket, in {@link #TERRAIN_BUCKETS} order; only solid is flagged opaque. */
     private static VkAccelerationStructureGeometryKHR.Buffer terrainGeometries(MemoryStack stack, long vertexAddr,
                                                                                long indexAddr, int vertexCount, int[] bucketTris,
                                                                                OpacityMicromap opacityMicromap) {
-        VkAccelerationStructureGeometryKHR.Buffer geom = VkAccelerationStructureGeometryKHR.calloc(terrainGeomCount(bucketTris), stack);
+        VkAccelerationStructureGeometryKHR.Buffer geom = VkAccelerationStructureGeometryKHR.calloc(bucketTris.length, stack);
         VkAccelerationStructureTrianglesOpacityMicromapEXT ommAttachment = null;
         if (opacityMicromap != null && bucketTris[BUCKET_CUTOUT] > 0) {
             VkMicromapUsageEXT.Buffer usage = micromapUsage(stack, opacityMicromap.triangleCount, opacityMicromap.subdivisionLevel);
@@ -614,42 +611,30 @@ public final class RtAccel {
                     .micromap(opacityMicromap.handle);
             ommAttachment.indexBuffer().deviceAddress(0L);
         }
-        int g = 0;
         for (int b = 0; b < bucketTris.length; b++) {
-            if (bucketTris[b] > 0) {
-                VkAccelerationStructureGeometryKHR out = geom.get(g++);
-                fillTriangleGeometry(out, vertexAddr, indexAddr, vertexCount, b == BUCKET_SOLID);
-                if (b == BUCKET_CUTOUT && ommAttachment != null) {
-                    out.geometry().triangles().pNext(ommAttachment.address());
-                }
+            VkAccelerationStructureGeometryKHR out = geom.get(b);
+            fillTriangleGeometry(out, vertexAddr, indexAddr, vertexCount, b == BUCKET_SOLID);
+            if (b == BUCKET_CUTOUT && ommAttachment != null) {
+                out.geometry().triangles().pNext(ommAttachment.address());
             }
         }
         return geom;
     }
 
-    /** Build ranges parallel to {@link #terrainGeometries}: each non-empty bucket's triangles begin right
-     *  after the preceding buckets in the shared index buffer (the section's buffers are packed in bucket
-     *  order), so the offset is the running triangle count times the 3-index stride. */
+    /** Build ranges parallel to {@link #terrainGeometries}; empty buckets get a zero primitive count. */
     private static VkAccelerationStructureBuildRangeInfoKHR.Buffer terrainBuildRanges(MemoryStack stack, int[] bucketTris) {
-        VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(terrainGeomCount(bucketTris), stack);
-        int g = 0, acc = 0;
-        for (int tris : bucketTris) {
-            if (tris > 0) {
-                range.get(g++).primitiveCount(tris).primitiveOffset(acc * 3 * Integer.BYTES).firstVertex(0).transformOffset(0);
-                acc += tris;
-            }
+        VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(bucketTris.length, stack);
+        int acc = 0;
+        for (int b = 0; b < bucketTris.length; b++) {
+            int tris = bucketTris[b];
+            range.get(b).primitiveCount(tris).primitiveOffset(acc * 3 * Integer.BYTES).firstVertex(0).transformOffset(0);
+            acc += tris;
         }
         return range;
     }
 
     private static int terrainGeomCount(int[] bucketTris) {
-        int n = 0;
-        for (int t : bucketTris) {
-            if (t > 0) {
-                n++;
-            }
-        }
-        return n;
+        return bucketTris.length;
     }
 
     private static VkAccelerationStructureBuildSizesInfoKHR queryTerrainBlasSizes(VkDevice vk, MemoryStack stack, RtBuffer positions,
@@ -663,9 +648,7 @@ public final class RtAccel {
                 .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(geom.capacity()).pGeometries(geom);
         java.nio.IntBuffer maxPrims = stack.mallocInt(geom.capacity());
         for (int tris : bucketTris) {
-            if (tris > 0) {
-                maxPrims.put(tris);
-            }
+            maxPrims.put(tris);
         }
         maxPrims.flip();
         VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
@@ -676,14 +659,17 @@ public final class RtAccel {
 
     /**
      * A TLAS instance: a 3x4 row-major transform, the device address of its BLAS, the 24-bit
-     * {@code instanceCustomIndex} the hit shaders read, and the 8-bit visibility {@code mask} (ANDed with
-     * the trace cull mask). Terrain passes its section-table index; dynamic entities set the high
-     * {@code ENTITY_BIT} flag so the hit shader takes the entity path. Mask defaults to 0xFF (visible to
-     * every ray); particles override it (0x02) so they are seen only by the primary ray (camera-only).
+     * {@code instanceCustomIndex} the hit shaders read, the 8-bit visibility {@code mask} (ANDed with the
+     * trace cull mask), and the base SBT hit-record offset. Terrain uses offset 0 so geometry index selects
+     * the material bucket; entities use {@link #SBT_ENTITY_OFFSET} so their single geometry keeps any-hit.
      */
-    public record Instance(float[] transform3x4, long blasDeviceAddress, int customIndex, int mask) {
+    public record Instance(float[] transform3x4, long blasDeviceAddress, int customIndex, int mask, int sbtRecordOffset) {
         public Instance(float[] transform3x4, long blasDeviceAddress, int customIndex) {
-            this(transform3x4, blasDeviceAddress, customIndex, 0xFF);
+            this(transform3x4, blasDeviceAddress, customIndex, 0xFF, 0);
+        }
+
+        public Instance(float[] transform3x4, long blasDeviceAddress, int customIndex, int mask) {
+            this(transform3x4, blasDeviceAddress, customIndex, mask, 0);
         }
     }
 
@@ -733,7 +719,7 @@ public final class RtAccel {
                 xform.clear();
                 xform.put(inst.transform3x4()).flip();
                 rec.transform().matrix(xform);
-                rec.instanceCustomIndex(inst.customIndex()).mask(inst.mask()).instanceShaderBindingTableRecordOffset(0)
+                rec.instanceCustomIndex(inst.customIndex()).mask(inst.mask()).instanceShaderBindingTableRecordOffset(inst.sbtRecordOffset())
                         .flags(0x00000001) // VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
                         .accelerationStructureReference(inst.blasDeviceAddress());
                 MemoryUtil.memCopy(rec.address(), instanceBuffer.mapped + (long) i * VkAccelerationStructureInstanceKHR.SIZEOF,

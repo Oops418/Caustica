@@ -19,8 +19,7 @@ struct Section {
     uint64_t primAddr;
     uint64_t idxAddr;
     uint64_t uvAddr;
-    uint triBase[3]; // any-hit opt: per-geometry triangle offset (solid/cutout/water packed in BUCKET order)
-    uint waterGeom;  // gl_GeometryIndexEXT of the water geometry (>= geom count if the section has no water)
+    uint triBase[4]; // fixed bucket triangle offsets: solid/cutout/translucent/water
 };
 // P5.1b-2 entity geometry record: the entity's {prim, index, uv} buffer addresses (same per-prim
 // {normal, tint} + UV layout as a terrain section) plus the address of a per-vertex world-space
@@ -298,7 +297,8 @@ void main() {
     }
 
     Section sec = SectionTable(pc.tableAddr).s[gl_InstanceCustomIndexEXT];
-    // Any-hit opt: the section BLAS has one geometry per material bucket (solid / cutout / water).
+    // Any-hit/SBT opt: the section BLAS has one fixed geometry per material bucket
+    // (solid / cutout / translucent / water).
     // gl_PrimitiveID restarts at 0 per geometry, so re-add this geometry's triangle base to land in the
     // section's packed prim/index/uv arrays (concatenated in BUCKET order). Water prims keep tint.w == 1,
     // so payload.material below is set from the prim exactly as before — no special-casing needed here.

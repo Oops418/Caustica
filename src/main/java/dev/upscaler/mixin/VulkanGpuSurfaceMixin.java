@@ -8,6 +8,7 @@ import com.mojang.blaze3d.vulkan.VulkanGpuSurface;
 import dev.upscaler.UpscalerConfig;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.RtComposite;
+import dev.upscaler.rt.RtFramePresenter;
 import dev.upscaler.rt.RtHdr;
 import it.unimi.dsi.fastutil.longs.LongList;
 import org.lwjgl.vulkan.VkSurfaceFormatKHR;
@@ -47,6 +48,13 @@ public abstract class VulkanGpuSurfaceMixin {
 	@Shadow
 	@Final
 	private long surface;
+
+	@Shadow
+	@Final
+	private org.lwjgl.vulkan.VkQueue presentQueue;
+
+	@Shadow
+	private long swapchain;
 
 	@Shadow
 	@Final
@@ -153,5 +161,28 @@ public abstract class VulkanGpuSurfaceMixin {
 	@Unique
 	private static long upscaler$vkImageView(GpuTextureView view) {
 		return view instanceof com.mojang.blaze3d.vulkan.VulkanGpuTextureView v ? v.vkImageView() : 0L;
+	}
+
+	/**
+	 * DLSS Frame Generation (slice 2): after Minecraft blits the real frame into its acquired swapchain image
+	 * (but before {@code present()} shows it), present the generated frame(s) into additional swapchain images
+	 * via {@link RtFramePresenter}, so the display order is generated-then-real. Runs only on the normal
+	 * present path — the HDR/scRGB present hooks cancel {@code blitFromTexture} at HEAD, so this TAIL is
+	 * skipped there (HDR+FG deferred). Iteration 1 duplicates the final frame (no DLSSG eval yet).
+	 */
+	@Inject(method = "blitFromTexture", at = @At("TAIL"))
+	private void upscaler$presentGeneratedFrames(CommandEncoderBackend commandEncoder, GpuTextureView textureView, CallbackInfo ci) {
+		if (this.currentImageIndex < 0 || !RtFramePresenter.INSTANCE.isActive()) {
+			return;
+		}
+		long srcImage = textureView.texture() instanceof com.mojang.blaze3d.vulkan.VulkanGpuTexture t ? t.vkImage() : 0L;
+		if (srcImage == 0L) {
+			return;
+		}
+		int generatedCount = dev.upscaler.rt.pipeline.RtDlssFg.INSTANCE.effectiveMultiFrameCount();
+		RtFramePresenter.INSTANCE.presentExtraFrames((VulkanCommandEncoder) commandEncoder, this.device,
+				this.swapchain, this.presentQueue, this.swapchainImages, this.presentSemaphores,
+				this.swapchainWidth, this.swapchainHeight,
+				srcImage, textureView.getWidth(0), textureView.getHeight(0), generatedCount);
 	}
 }

@@ -9,9 +9,12 @@ import dev.upscaler.mixin.GpuDeviceAccessor;
 import dev.upscaler.ngx.NgxLibrary;
 import dev.upscaler.ngx.NgxRuntime;
 
+import org.joml.Matrix4fc;
 import org.lwjgl.vulkan.VK10;
 
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 
 /**
  * DLSS Frame Generation (DLSSG) backend. Shares the NGX instance with DLSS-RR via {@link NgxRuntime};
@@ -60,6 +63,13 @@ public final class RtDlssFg {
 
     public boolean isReady() {
         return initialized && !failed && !isNull(feature);
+    }
+
+    /** Whether a live feature already matches these dimensions/format (no recreate needed). */
+    public boolean featureReadyFor(int width, int height, int renderWidth, int renderHeight, int backbufferFormat) {
+        return isReady() && featureWidth == width && featureHeight == height
+                && featureRenderWidth == renderWidth && featureRenderHeight == renderHeight
+                && featureBackbufferFormat == backbufferFormat;
     }
 
     /**
@@ -137,6 +147,76 @@ public final class RtDlssFg {
             UpscalerMod.LOGGER.error("DLSS-FG setup failed; frame generation disabled", t);
             return false;
         }
+    }
+
+    /**
+     * Record one DLSSG evaluation: generate interpolated frame {@code multiFrameIndex} of
+     * {@code multiFrameCount} from the final {@code backbuffer} + HW {@code depth} + {@code mvec} into
+     * {@code outputInterp}. Optional resources (hudless/ui/outputReal) pass 0 handles to skip. Matrices are
+     * jitter-free (NGX left-multiply layout); pass {@code null} to leave one out. Returns false on failure.
+     */
+    public boolean evaluate(long cmd,
+            long backbufferView, long backbufferImage, int backbufferFormat,
+            long depthView, long depthImage, int depthFormat,
+            long mvecView, long mvecImage, int mvecFormat,
+            long outputInterpView, long outputInterpImage, int outputInterpFormat,
+            int width, int height, int mvecDepthWidth, int mvecDepthHeight,
+            int multiFrameCount, int multiFrameIndex, float mvScaleX, float mvScaleY,
+            boolean depthInverted, boolean colorBuffersHDR, boolean cameraMotionIncluded, boolean reset,
+            Matrix4fc clipToPrevClip, Matrix4fc prevClipToClip) {
+        if (!isReady()) {
+            return false;
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment clipToPrev = matrixSegment(arena, clipToPrevClip);
+            MemorySegment prevToClip = matrixSegment(arena, prevClipToClip);
+            int rc = lib.evaluateDlssg(cmd, feature,
+                    backbufferView, backbufferImage, backbufferFormat,
+                    depthView, depthImage, depthFormat,
+                    mvecView, mvecImage, mvecFormat,
+                    0L, 0L, 0, // hudless (skip for now)
+                    0L, 0L, 0, // ui (skip for now)
+                    outputInterpView, outputInterpImage, outputInterpFormat,
+                    0L, 0L, 0, // outputReal (skip; MC presents the real frame itself)
+                    width, height, mvecDepthWidth, mvecDepthHeight,
+                    multiFrameCount, multiFrameIndex, mvScaleX, mvScaleY,
+                    depthInverted ? 1 : 0, colorBuffersHDR ? 1 : 0, cameraMotionIncluded ? 1 : 0, reset ? 1 : 0,
+                    MemorySegment.NULL, MemorySegment.NULL, clipToPrev, prevToClip);
+            if (NgxRuntime.ngxFailed(rc)) {
+                throw new IllegalStateException("ngxshim_evaluate_dlssg failed: 0x" + Integer.toHexString(rc)
+                        + " last=0x" + Integer.toHexString(lib.lastResult()));
+            }
+            return true;
+        } catch (Throwable t) {
+            failed = true;
+            UpscalerMod.LOGGER.error("DLSS-FG evaluate failed; frame generation disabled", t);
+            return false;
+        }
+    }
+
+    /** Format a JOML matrix into NGX left-multiply (row-major) layout, or NULL for a null matrix. */
+    private static MemorySegment matrixSegment(Arena arena, Matrix4fc m) {
+        if (m == null) {
+            return MemorySegment.NULL;
+        }
+        MemorySegment seg = arena.allocate(ValueLayout.JAVA_FLOAT, 16);
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 0, m.m00());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 1, m.m01());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 2, m.m02());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 3, m.m03());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 4, m.m10());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 5, m.m11());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 6, m.m12());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 7, m.m13());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 8, m.m20());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 9, m.m21());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 10, m.m22());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 11, m.m23());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 12, m.m30());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 13, m.m31());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 14, m.m32());
+        seg.setAtIndex(ValueLayout.JAVA_FLOAT, 15, m.m33());
+        return seg;
     }
 
     /** Release the FG feature. NGX itself is shut down by {@link NgxRuntime} at device teardown. */

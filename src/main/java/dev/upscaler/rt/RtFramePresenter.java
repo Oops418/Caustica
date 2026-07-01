@@ -4,6 +4,7 @@ import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 
 import dev.upscaler.UpscalerMod;
+import dev.upscaler.rt.accel.RtImage;
 import dev.upscaler.rt.pipeline.RtDlssFg;
 
 import it.unimi.dsi.fastutil.longs.LongList;
@@ -74,16 +75,22 @@ public final class RtFramePresenter {
      */
     public void prepareExtraFrames(VulkanCommandEncoder enc, VulkanDevice device, long swapchain,
             LongList swapchainImages, long[] presentSemaphores, int swapW, int swapH,
-            long srcImage, int srcW, int srcH, int generatedCount) {
+            long backbufferView, long srcImage, int srcW, int srcH, int generatedCount) {
         pendingCount = 0;
         if (failed || swapchain == 0L || srcImage == 0L || generatedCount <= 0) {
             return;
         }
         try {
             ensureCapacity(device, swapchainImages.size() + 1, generatedCount);
-            int copyW = Math.min(swapW, srcW);
-            int copyH = Math.min(swapH, srcH);
             for (int i = 0; i < generatedCount; i++) {
+                // The generated frame is DLSSG's interpolated output; if FG isn't producing it (disabled,
+                // not ready, or eval failed) fall back to duplicating the real frame (proven present path).
+                RtImage interp = RtComposite.INSTANCE.fgInterpolate(enc, backbufferView, srcImage,
+                        swapW, swapH, i + 1, generatedCount);
+                long blitSrc = interp != null ? interp.image : srcImage;
+                int copyW = Math.min(swapW, interp != null ? interp.width : srcW);
+                int copyH = Math.min(swapH, interp != null ? interp.height : srcH);
+
                 long acquireSem = acquireSemaphores[acquireCursor];
                 acquireCursor = (acquireCursor + 1) % acquireSemaphores.length;
 
@@ -98,7 +105,7 @@ public final class RtFramePresenter {
                 }
                 long dstImage = swapchainImages.getLong(imageIndex);
                 long presentSem = presentSemaphores[imageIndex];
-                recordBlit(enc, srcImage, dstImage, copyW, copyH, acquireSem, presentSem);
+                recordBlit(enc, blitSrc, dstImage, copyW, copyH, acquireSem, presentSem);
 
                 pendingImageIndex[pendingCount] = imageIndex;
                 pendingPresentSem[pendingCount] = presentSem;
@@ -147,7 +154,11 @@ public final class RtFramePresenter {
                     .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
                     .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(dstImage);
             toDst.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
-            VkDependencyInfo dep1 = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toDst);
+            // Make the source's prior writes visible to the blit read — the world render (duplicate path) or
+            // the DLSSG evaluate that wrote the interp image earlier in this same submit (interp path).
+            VkMemoryBarrier2.Buffer srcVis = VkMemoryBarrier2.calloc(1, stack).sType$Default();
+            srcVis.get(0).srcStageMask(65536L).srcAccessMask(65536L).dstStageMask(4096L).dstAccessMask(2048L);
+            VkDependencyInfo dep1 = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toDst).pMemoryBarriers(srcVis);
             KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep1);
 
             // Blit final frame (GENERAL) -> swapchain (TRANSFER_DST), Y-flipped like vanilla.

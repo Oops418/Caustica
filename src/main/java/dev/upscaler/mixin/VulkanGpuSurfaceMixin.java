@@ -176,6 +176,7 @@ public abstract class VulkanGpuSurfaceMixin {
 			return;
 		}
 		long srcImage = textureView.texture() instanceof com.mojang.blaze3d.vulkan.VulkanGpuTexture t ? t.vkImage() : 0L;
+		long srcView = upscaler$vkImageView(textureView);
 		if (srcImage == 0L) {
 			return;
 		}
@@ -183,7 +184,7 @@ public abstract class VulkanGpuSurfaceMixin {
 		RtFramePresenter.INSTANCE.prepareExtraFrames((VulkanCommandEncoder) commandEncoder, this.device,
 				this.swapchain, this.swapchainImages, this.presentSemaphores,
 				this.swapchainWidth, this.swapchainHeight,
-				srcImage, textureView.getWidth(0), textureView.getHeight(0), generatedCount);
+				srcView, srcImage, textureView.getWidth(0), textureView.getHeight(0), generatedCount);
 	}
 
 	// Present the FG-generated frame(s) acquired/recorded at blitFromTexture TAIL — at present() HEAD, after

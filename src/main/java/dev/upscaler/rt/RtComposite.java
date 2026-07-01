@@ -44,6 +44,7 @@ import dev.upscaler.rt.material.RtBlockMaterials;
 import dev.upscaler.rt.material.RtEntityMaterials;
 import dev.upscaler.rt.material.RtMaterials;
 import dev.upscaler.rt.pipeline.RtDisplayPipeline;
+import dev.upscaler.rt.pipeline.RtDlssFg;
 import dev.upscaler.rt.pipeline.RtDlssRr;
 import dev.upscaler.rt.pipeline.RtHdrCompositePipeline;
 import dev.upscaler.rt.pipeline.RtSdrPresentPipeline;
@@ -194,6 +195,15 @@ public final class RtComposite {
     // raw-copied (washed). Lazily created; the image is sized to the swapchain.
     private RtSdrPresentPipeline sdrPresentPipeline;
     private RtImage sdrPresentImage;
+    // DLSS Frame Generation: per-generated-frame interpolated output images (backbuffer size/format), and
+    // the jitter-free reprojection matrices derived from the MV view-projections each frame.
+    private RtImage[] fgInterp = new RtImage[0];
+    private int fgInterpW = -1;
+    private int fgInterpH = -1;
+    private boolean fgReset = true;
+    private final Matrix4f fgClipToPrev = new Matrix4f();
+    private final Matrix4f fgPrevToClip = new Matrix4f();
+    private final Matrix4f fgMatTmp = new Matrix4f();
     // Guide buffers (first-hit attributes for DLSS-RR): normal+roughness, albedo, depth, motion,
     // specular albedo, and reflection motion.
     private RtImage gNormal;
@@ -968,6 +978,14 @@ public final class RtComposite {
             sdrPresentImage.destroy();
             sdrPresentImage = null;
         }
+        for (RtImage img : fgInterp) {
+            if (img != null) {
+                img.destroy();
+            }
+        }
+        fgInterp = new RtImage[0];
+        fgInterpW = -1;
+        fgInterpH = -1;
         if (worldPipeline != null) {
             worldPipeline.destroy();
             worldPipeline = null;
@@ -1262,5 +1280,87 @@ public final class RtComposite {
         region.get(0).dstOffsets(1).set(dst.width, dst.height, 1);
         VK10.vkCmdBlitImage(cmd, src.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                 dst.image, VK10.VK_IMAGE_LAYOUT_GENERAL, region, VK10.VK_FILTER_LINEAR);
+    }
+
+    /**
+     * DLSS Frame Generation: record the DLSSG evaluate for generated frame {@code index} of {@code count}
+     * (backbuffer = the final frame; HW depth = {@code gDepth}; motion = {@code gMotion}) into Minecraft's
+     * command encoder, returning the interpolated output image (backbuffer size) for {@link RtFramePresenter}
+     * to blit into a generated swapchain image. On {@code index == 1} it ensures the feature (created in its
+     * own synchronous submit), the per-index output images, and the jitter-free reprojection matrices.
+     * Returns {@code null} when FG isn't producing this frame (caller falls back to duplicating the real
+     * frame). Rotation-only matrices; camera translation is carried by the mvecs (cameraMotionIncluded).
+     */
+    public RtImage fgInterpolate(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
+            int swapW, int swapH, int index, int count) {
+        if (failed || gDepth == null || gMotion == null || !frameCaptured) {
+            return null;
+        }
+        RtContext ctx = RtContext.currentOrNull();
+        if (ctx == null) {
+            return null;
+        }
+        final int fmt = VK10.VK_FORMAT_R8G8B8A8_UNORM; // Minecraft's main render target format
+        if (index == 1) {
+            if (!ensureFgFeature(ctx, swapW, swapH, renderW, renderH, fmt)) {
+                return null;
+            }
+            ensureFgInterp(ctx, count, swapW, swapH, fmt);
+            // clipToPrevClip = prevVP * inverse(curVP); prevClipToClip = curVP * inverse(prevVP). Both from
+            // the (rotation-only, camera-relative) MV view-projections, so jitter-free.
+            fgMatTmp.set(mvCurProjView).invert();
+            fgClipToPrev.set(mvPrevProjView).mul(fgMatTmp);
+            fgMatTmp.set(mvPrevProjView).invert();
+            fgPrevToClip.set(mvCurProjView).mul(fgMatTmp);
+        }
+        if (index < 1 || index > fgInterp.length || fgInterp[index - 1] == null) {
+            return null;
+        }
+        RtImage out = fgInterp[index - 1];
+        VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
+        boolean ok = RtDlssFg.INSTANCE.evaluate(cmd.address(),
+                backbufferView, backbufferImage, fmt,
+                gDepth.view, gDepth.image, VK10.VK_FORMAT_R32_SFLOAT,
+                gMotion.view, gMotion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
+                out.view, out.image, fmt,
+                swapW, swapH, renderW, renderH, count, index, 1.0f, 1.0f,
+                true /* depthInverted (reversed-Z) */, false /* colorBuffersHDR (SDR path) */,
+                true /* cameraMotionIncluded (in mvecs) */, fgReset,
+                fgClipToPrev, fgPrevToClip);
+        VK10.vkEndCommandBuffer(cmd);
+        fgReset = false;
+        if (!ok) {
+            return null;
+        }
+        enc.execute(cmd);
+        return out;
+    }
+
+    private boolean ensureFgFeature(RtContext ctx, int w, int h, int rw, int rh, int fmt) {
+        if (RtDlssFg.INSTANCE.featureReadyFor(w, h, rw, rh, fmt)) {
+            return true;
+        }
+        // Create the feature in its own submit + wait (not folded into MC's frame submit).
+        ctx.submitSync(c -> RtDlssFg.INSTANCE.ensureFeature(c.address(), w, h, rw, rh, fmt));
+        fgReset = true; // fresh feature has no temporal history
+        return RtDlssFg.INSTANCE.featureReadyFor(w, h, rw, rh, fmt);
+    }
+
+    private void ensureFgInterp(RtContext ctx, int count, int w, int h, int fmt) {
+        if (fgInterp.length == count && fgInterpW == w && fgInterpH == h
+                && (count == 0 || fgInterp[0] != null)) {
+            return;
+        }
+        for (RtImage img : fgInterp) {
+            if (img != null) {
+                img.destroy();
+            }
+        }
+        fgInterp = new RtImage[count];
+        for (int i = 0; i < count; i++) {
+            fgInterp[i] = ctx.createStorageImage(w, h, fmt, "FG interp " + i + " " + w + "x" + h);
+        }
+        fgInterpW = w;
+        fgInterpH = h;
     }
 }

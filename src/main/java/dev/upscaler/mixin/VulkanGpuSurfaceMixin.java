@@ -8,10 +8,17 @@ import com.mojang.blaze3d.vulkan.VulkanGpuSurface;
 import dev.upscaler.UpscalerConfig;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.RtComposite;
+import dev.upscaler.rt.RtDeviceBringup;
 import dev.upscaler.rt.RtFramePresenter;
 import dev.upscaler.rt.RtHdr;
 import it.unimi.dsi.fastutil.longs.LongList;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.KHRSwapchain;
+import org.lwjgl.vulkan.VkAllocationCallbacks;
+import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkSurfaceFormatKHR;
+import org.lwjgl.vulkan.VkSwapchainCreateInfoKHR;
+import org.lwjgl.vulkan.VkSwapchainLatencyCreateInfoNV;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -19,8 +26,11 @@ import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+import java.nio.LongBuffer;
 
 /**
  * HDR Phase 0 capability logging + Phase 2 step B scRGB swapchain selection.
@@ -123,6 +133,34 @@ public abstract class VulkanGpuSurfaceMixin {
 			index = 0)
 	private int upscaler$overrideColorSpace(int original) {
 		return this.upscaler$colorSpace != 0 ? this.upscaler$colorSpace : original;
+	}
+
+	/**
+	 * Reflex Phase 1a: chain {@code VkSwapchainLatencyCreateInfoNV{latencyModeEnable=true}} into the
+	 * swapchain's pNext at creation. Per spec {@code vkSetLatencySleepModeNV} (not called yet — lands with
+	 * the sleep loop) only takes effect on a swapchain created with this flag, so it has to be set here,
+	 * before there's any other reason to touch swapchain creation. Preserves whatever pNext was already
+	 * there (currently nothing else chains one). The extra struct is stack-allocated and only needs to
+	 * survive this call — Vulkan reads pNext chains synchronously during {@code vkCreateSwapchainKHR}, it
+	 * doesn't retain the pointer afterward, so freeing it when this method's stack frame pops is safe even
+	 * though {@code pCreateInfo} isn't touched again after this point in {@code configure()}. No-op (calls
+	 * through unchanged) when Reflex isn't enabled + device-supported.
+	 */
+	@Redirect(method = "configure",
+			at = @At(value = "INVOKE",
+					target = "Lorg/lwjgl/vulkan/KHRSwapchain;vkCreateSwapchainKHR(Lorg/lwjgl/vulkan/VkDevice;Lorg/lwjgl/vulkan/VkSwapchainCreateInfoKHR;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Ljava/nio/LongBuffer;)I"))
+	private int upscaler$createSwapchainWithReflex(VkDevice device, VkSwapchainCreateInfoKHR pCreateInfo,
+			VkAllocationCallbacks pAllocator, LongBuffer pSwapchain) {
+		if (!RtDeviceBringup.reflexEnabled()) {
+			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+		}
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
+			latency.pNext(pCreateInfo.pNext());
+			latency.latencyModeEnable(true);
+			pCreateInfo.pNext(latency.address());
+			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+		}
 	}
 
 	/**

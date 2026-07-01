@@ -22,6 +22,7 @@ import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapPropertiesEXT;
 import org.spongepowered.asm.mixin.injection.invoke.arg.Args;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -36,6 +37,7 @@ import static org.lwjgl.vulkan.KHRRayTracingPositionFetch.VK_STRUCTURE_TYPE_PHYS
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT;
+import static org.lwjgl.vulkan.NVLowLatency2.VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
 
 /**
  * RT device bring-up. Enables the hardware ray-tracing device extensions and their
@@ -82,8 +84,15 @@ public final class RtDeviceBringup {
     public static final List<String> OPTIONAL_RT_EXTENSIONS = List.of(
             VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
 
+    /**
+     * NVIDIA Reflex. {@code VK_NV_low_latency2} adds no feature bits (function-only extension), so unlike
+     * OMM it needs no {@code VkPhysicalDevice*Features} struct — just the extension name, gated the same way.
+     */
+    public static final List<String> REFLEX_EXTENSIONS = List.of(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+
     private static volatile boolean rtRequested;
     private static volatile boolean ommEnabled; // VK_EXT_opacity_micromap actually enabled on the device
+    private static volatile boolean reflexEnabled; // VK_NV_low_latency2 actually enabled on the device
     private static volatile int maxOpacity4StateSubdivisionLevel;
     private static boolean loggedUnavailable;
 
@@ -100,6 +109,11 @@ public final class RtDeviceBringup {
         return ommEnabled;
     }
 
+    /** True if {@code VK_NV_low_latency2} (Reflex) was enabled on the device (gate on + device support). */
+    public static boolean reflexEnabled() {
+        return reflexEnabled;
+    }
+
     /** Hardware limit for 4-state opacity micromaps, populated by {@link #probe(VkDevice)}. */
     public static int maxOpacity4StateSubdivisionLevel() {
         return maxOpacity4StateSubdivisionLevel;
@@ -107,14 +121,22 @@ public final class RtDeviceBringup {
 
     /** Optional extensions the gate wants AND the device supports — added but never required. */
     private static List<String> supportedOptionalExtensions(VulkanPhysicalDevice physicalDevice) {
-        if (!ommRequested()) {
-            return List.of();
+        List<String> supported = new ArrayList<>();
+        if (ommRequested()) {
+            OPTIONAL_RT_EXTENSIONS.stream().filter(physicalDevice::hasDeviceExtension).forEach(supported::add);
         }
-        return OPTIONAL_RT_EXTENSIONS.stream().filter(physicalDevice::hasDeviceExtension).toList();
+        if (reflexRequested()) {
+            REFLEX_EXTENSIONS.stream().filter(physicalDevice::hasDeviceExtension).forEach(supported::add);
+        }
+        return supported;
     }
 
     private static boolean ommRequested() {
         return UpscalerConfig.Rt.Omm.ENABLED.value();
+    }
+
+    private static boolean reflexRequested() {
+        return UpscalerConfig.Rt.Reflex.ENABLED.value();
     }
 
     private static String firstUnsupported(VulkanPhysicalDevice physicalDevice) {
@@ -203,13 +225,18 @@ public final class RtDeviceBringup {
             features.add(new VulkanFeature(ommStruct, "micromap",
                     VkPhysicalDeviceOpacityMicromapFeaturesEXT.MICROMAP));
         }
+
+        // Optional: NVIDIA Reflex (VK_NV_low_latency2). Function-only extension, no feature struct to add.
+        reflexEnabled = reflexRequested() && physicalDevice.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+
         args.set(2, features);
 
         rtRequested = true;
         UpscalerMod.LOGGER.info(
-                "Ray tracing: enabling {}{} + features [bufferDeviceAddress, accelerationStructure, rayTracingPipeline"
+                "Ray tracing: enabling {}{}{} + features [bufferDeviceAddress, accelerationStructure, rayTracingPipeline"
                         + (ommEnabled ? ", opacityMicromap" : "") + "] on [{}]",
-                RT_EXTENSIONS, ommEnabled ? " + " + OPTIONAL_RT_EXTENSIONS : "", physicalDevice.deviceName());
+                RT_EXTENSIONS, ommEnabled ? " + " + OPTIONAL_RT_EXTENSIONS : "",
+                reflexEnabled ? " + " + REFLEX_EXTENSIONS : "", physicalDevice.deviceName());
     }
 
     /**
@@ -263,6 +290,21 @@ public final class RtDeviceBringup {
                             ommProps.maxOpacity4StateSubdivisionLevel(), ommProps.maxOpacity2StateSubdivisionLevel());
                 } else {
                     maxOpacity4StateSubdivisionLevel = 0;
+                }
+            }
+            if (reflexEnabled) {
+                boolean sleepMode = caps.vkSetLatencySleepModeNV != 0L;
+                boolean sleep = caps.vkLatencySleepNV != 0L;
+                boolean marker = caps.vkSetLatencyMarkerNV != 0L;
+                boolean timings = caps.vkGetLatencyTimingsNV != 0L;
+                if (sleepMode && sleep && marker && timings) {
+                    UpscalerMod.LOGGER.info(
+                            "Reflex (VK_NV_low_latency2) entry points loaded — sleep-mode/markers not yet wired into the frame loop");
+                } else {
+                    UpscalerMod.LOGGER.error(
+                            "Reflex extension enabled but entry points missing (sleepMode={}, sleep={}, marker={}, timings={})",
+                            sleepMode, sleep, marker, timings);
+                    reflexEnabled = false;
                 }
             }
         } catch (Throwable t) {

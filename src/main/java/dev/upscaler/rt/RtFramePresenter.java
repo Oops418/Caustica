@@ -39,15 +39,19 @@ import java.nio.LongBuffer;
  * a self-contained present here failed validation). Then at {@code present()} HEAD we present the extra
  * image(s) before MC presents the real one, giving display order generated-then-real.
  *
- * <p><b>Iteration 1 — present machinery only.</b> The generated frame is a copy of the final rendered frame
- * (no DLSSG evaluate yet) to isolate the Vulkan plumbing; slice 2b swaps the duplicate for the interpolated
- * frame from {@link RtDlssFg}. Engaged only on the normal present path (HDR/scRGB cancel
- * {@code blitFromTexture} at HEAD); gated by {@code upscaler.rt.fg} (default off).
+ * <p>The generated frame is {@link RtDlssFg}'s real DLSSG-interpolated output (via
+ * {@link RtComposite#fgInterpolate}); when there's simply no captured RT frame this tick (menu/loading/
+ * transition — routine) it falls back to duplicating the real frame for just that one frame (see
+ * {@code interpFallbackDuplicate} in the present-rate log), but a genuine FG failure is fatal (see that
+ * method's docs) rather than silently duplicating forever. Engaged only on the normal present path
+ * (HDR/scRGB cancel {@code blitFromTexture} at HEAD); gated by {@code upscaler.rt.fg} (default off).
  */
 public final class RtFramePresenter {
     public static final RtFramePresenter INSTANCE = new RtFramePresenter();
 
     private static final long ACQUIRE_TIMEOUT_NS = 5_000_000_000L;
+
+    private static final long LOG_INTERVAL_NS = 1_000_000_000L;
 
     private long[] acquireSemaphores = new long[0];
     private int acquireCursor;
@@ -57,6 +61,14 @@ public final class RtFramePresenter {
     private int[] pendingImageIndex = new int[0];
     private long[] pendingPresentSem = new long[0];
     private int pendingCount;
+
+    // Present-rate diagnostics: real vs generated vkQueuePresentKHR calls per second, independent of MC's own
+    // fps counter (which only counts rendered/simulated frames, not our extra presents).
+    private long logWindowStartNs;
+    private int realFramesInWindow;
+    private int generatedFramesInWindow;
+    private int interpOkInWindow;
+    private int interpFallbackInWindow;
 
     private RtFramePresenter() {
     }
@@ -71,7 +83,9 @@ public final class RtFramePresenter {
      * Acquire {@code generatedCount} extra swapchain images and record a Y-flipped blit of {@code srcImage}
      * (the final rendered frame, GENERAL layout) into each, using Minecraft's command encoder {@code enc} so
      * the work rides MC's next {@code submit()}. The presents happen later in {@link #flushPendingPresents}.
-     * Iteration 1: a duplicate of the final frame (no DLSSG eval yet). Failures latch FG off for the session.
+     * Blits DLSSG's real interpolated output per generated frame, or a duplicate of the real frame when RT
+     * simply isn't producing frames this tick (routine). A genuine DLSSG failure latches FG off for the
+     * session — see {@link RtComposite#fgInterpolate}.
      */
     public void prepareExtraFrames(VulkanCommandEncoder enc, VulkanDevice device, long swapchain,
             LongList swapchainImages, long[] presentSemaphores, int swapW, int swapH,
@@ -83,10 +97,16 @@ public final class RtFramePresenter {
         try {
             ensureCapacity(device, swapchainImages.size() + 1, generatedCount);
             for (int i = 0; i < generatedCount; i++) {
-                // The generated frame is DLSSG's interpolated output; if FG isn't producing it (disabled,
-                // not ready, or eval failed) fall back to duplicating the real frame (proven present path).
+                // null = no captured RT frame this tick (menu/loading/transition — routine, not a bug): fall
+                // back to duplicating the real frame for just this one frame. A genuine FG failure instead
+                // throws, caught below, which disables FG for the session.
                 RtImage interp = RtComposite.INSTANCE.fgInterpolate(enc, backbufferView, srcImage,
                         swapW, swapH, i + 1, generatedCount);
+                if (interp != null) {
+                    interpOkInWindow++;
+                } else {
+                    interpFallbackInWindow++;
+                }
                 long blitSrc = interp != null ? interp.image : srcImage;
                 int copyW = Math.min(swapW, interp != null ? interp.width : srcW);
                 int copyH = Math.min(swapH, interp != null ? interp.height : srcH);
@@ -124,24 +144,62 @@ public final class RtFramePresenter {
      * frame, giving generated-then-real order).
      */
     public void flushPendingPresents(long swapchain, VkQueue presentQueue) {
-        if (failed || pendingCount == 0) {
+        int presentedThisFrame = 0;
+        if (!failed && pendingCount != 0) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                for (int i = 0; i < pendingCount; i++) {
+                    VkPresentInfoKHR present = VkPresentInfoKHR.calloc(stack).sType$Default();
+                    present.pWaitSemaphores(stack.longs(pendingPresentSem[i]));
+                    present.swapchainCount(1);
+                    present.pSwapchains(stack.longs(swapchain));
+                    present.pImageIndices(stack.ints(pendingImageIndex[i]));
+                    KHRSwapchain.vkQueuePresentKHR(presentQueue, present);
+                    presentedThisFrame++;
+                }
+            } catch (Throwable t) {
+                failed = true;
+                UpscalerMod.LOGGER.error("DLSS-FG present failed; frame generation disabled", t);
+            } finally {
+                pendingCount = 0;
+            }
+        }
+        if (RtDlssFg.enabled()) {
+            logPresentRate(presentedThisFrame);
+        }
+    }
+
+    /**
+     * Debug diagnostic (2026-07-01): tracks real vs generated {@code vkQueuePresentKHR} calls per second,
+     * separate from MC's own fps counter — that counter only reflects simulated/rendered frames
+     * (blitFromTexture calls), so it would NOT show an increase from FG's extra presents even if the display
+     * is genuinely receiving more frames. Logged only when {@code upscaler.rt.fg} is enabled.
+     */
+    private void logPresentRate(int generatedThisFrame) {
+        realFramesInWindow++;
+        generatedFramesInWindow += generatedThisFrame;
+        long now = System.nanoTime();
+        if (logWindowStartNs == 0L) {
+            logWindowStartNs = now;
             return;
         }
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            for (int i = 0; i < pendingCount; i++) {
-                VkPresentInfoKHR present = VkPresentInfoKHR.calloc(stack).sType$Default();
-                present.pWaitSemaphores(stack.longs(pendingPresentSem[i]));
-                present.swapchainCount(1);
-                present.pSwapchains(stack.longs(swapchain));
-                present.pImageIndices(stack.ints(pendingImageIndex[i]));
-                KHRSwapchain.vkQueuePresentKHR(presentQueue, present);
-            }
-        } catch (Throwable t) {
-            failed = true;
-            UpscalerMod.LOGGER.error("DLSS-FG present failed; frame generation disabled", t);
-        } finally {
-            pendingCount = 0;
+        long elapsed = now - logWindowStartNs;
+        if (elapsed < LOG_INTERVAL_NS) {
+            return;
         }
+        double seconds = elapsed / 1.0e9;
+        double realFps = realFramesInWindow / seconds;
+        double totalFps = (realFramesInWindow + generatedFramesInWindow) / seconds;
+        UpscalerMod.LOGGER.info(
+                "[FG present-rate] real={} gen={} realFps={} totalPresentFps={} configuredMultiFrameCount={} "
+                        + "interpOk={} interpFallbackDuplicate={}",
+                realFramesInWindow, generatedFramesInWindow,
+                String.format("%.1f", realFps), String.format("%.1f", totalFps),
+                RtDlssFg.INSTANCE.effectiveMultiFrameCount(), interpOkInWindow, interpFallbackInWindow);
+        logWindowStartNs = now;
+        realFramesInWindow = 0;
+        generatedFramesInWindow = 0;
+        interpOkInWindow = 0;
+        interpFallbackInWindow = 0;
     }
 
     private void recordBlit(VulkanCommandEncoder enc, long srcImage, long dstImage, int copyW, int copyH,

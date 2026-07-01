@@ -1288,8 +1288,15 @@ public final class RtComposite {
      * command encoder, returning the interpolated output image (backbuffer size) for {@link RtFramePresenter}
      * to blit into a generated swapchain image. On {@code index == 1} it ensures the feature (created in its
      * own synchronous submit), the per-index output images, and the jitter-free reprojection matrices.
-     * Returns {@code null} when FG isn't producing this frame (caller falls back to duplicating the real
-     * frame). Rotation-only matrices; camera translation is carried by the mvecs (cameraMotionIncluded).
+     * Returns {@code null} (caller falls back to duplicating the real frame for this one frame, no session
+     * impact) when there's simply no captured RT frame to interpolate from right now — routine and expected
+     * on menu/loading/transition frames, since {@link RtFramePresenter#isActive} only gates on being in a
+     * world, not on RT having actually produced a frame this tick. Throws instead for failures that should
+     * never happen once RT is actively producing frames (DLSSG feature creation failing, an out-of-range
+     * index, the evaluate itself failing) — the caller treats those as fatal and disables FG for the
+     * session, same as any other FG present-record failure, rather than silently degrading to duplicated
+     * (non-interpolated) frames forever with no visible sign anything is wrong. Rotation-only matrices;
+     * camera translation is carried by the mvecs (cameraMotionIncluded).
      */
     public RtImage fgInterpolate(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
             int swapW, int swapH, int index, int count) {
@@ -1303,7 +1310,7 @@ public final class RtComposite {
         final int fmt = VK10.VK_FORMAT_R8G8B8A8_UNORM; // Minecraft's main render target format
         if (index == 1) {
             if (!ensureFgFeature(ctx, swapW, swapH, renderW, renderH, fmt)) {
-                return null;
+                throw new IllegalStateException("DLSSG feature not ready (ensureFgFeature failed)");
             }
             ensureFgInterp(ctx, count, swapW, swapH, fmt);
             // clipToPrevClip = prevVP * inverse(curVP); prevClipToClip = curVP * inverse(prevVP). Both from
@@ -1314,7 +1321,8 @@ public final class RtComposite {
             fgPrevToClip.set(mvCurProjView).mul(fgMatTmp);
         }
         if (index < 1 || index > fgInterp.length || fgInterp[index - 1] == null) {
-            return null;
+            throw new IllegalStateException(
+                    "fgInterpolate index " + index + " out of range for fgInterp[" + fgInterp.length + "]");
         }
         RtImage out = fgInterp[index - 1];
         VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
@@ -1330,7 +1338,7 @@ public final class RtComposite {
         VK10.vkEndCommandBuffer(cmd);
         fgReset = false;
         if (!ok) {
-            return null;
+            throw new IllegalStateException("ngxshim_evaluate_dlssg failed (RtDlssFg.evaluate returned false)");
         }
         enc.execute(cmd);
         return out;

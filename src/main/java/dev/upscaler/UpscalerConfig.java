@@ -519,6 +519,10 @@ public final class UpscalerConfig {
 
         public static final class Entities {
             public static final BooleanSetting ENABLED = bool("upscaler.rt.entities", true);
+            // Reuse an entity's previous mesh buffers + BLAS when this frame's pose is a rigid transform
+            // (translation and/or yaw) of the cached one — still mobs, item frames, armor stands, and
+            // spinning/bobbing dropped items skip the re-upload and BLAS refit entirely.
+            public static final BooleanSetting RIGID_REUSE = bool("upscaler.rt.entityRigidReuse", true);
             public static final BooleanSetting PARTICLES_ENABLED = bool("upscaler.rt.particles", true);
             public static final IntSetting MAX_ENTITIES = intAtLeast("upscaler.rt.maxEntities", 1024, 1);
             public static final IntSetting BE_VIEW_CHUNKS = intAtLeast("upscaler.rt.beViewChunks", 8, 0);

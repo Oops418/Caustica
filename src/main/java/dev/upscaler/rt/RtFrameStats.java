@@ -5,10 +5,13 @@ import dev.upscaler.UpscalerMod;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.List;
 import net.fabricmc.loader.api.FabricLoader;
 
 /**
@@ -32,9 +35,35 @@ public final class RtFrameStats {
     public static final Profile STREAM = new Profile("terrain-stream",
             new String[] {"finalize", "snapshotDispatch", "drainUpload", "startBuild"},
             new String[] {"sectionsSnapshotted", "sectionsUploaded"});
+    // trackGc: the composite profile also logs per-frame GC deltas (collection count + reported pause ms)
+    // so hitches with no stage attribution can be pinned on (or cleared of) garbage collection.
     public static final Profile COMPOSITE = new Profile("composite",
             new String[] {"entityCapture", "beCapture", "particles", "blasRecord", "prepareTlas", "traceRecord"},
-            new String[] {"entitiesCaptured", "refits", "vmaBufferCreates"});
+            new String[] {"entitiesCaptured", "refits", "entityReuse", "vmaBufferCreates"}, true);
+
+    private static final List<GarbageCollectorMXBean> GC_BEANS = ManagementFactory.getGarbageCollectorMXBeans();
+
+    private static long gcCollections() {
+        long total = 0;
+        for (GarbageCollectorMXBean bean : GC_BEANS) {
+            long count = bean.getCollectionCount();
+            if (count > 0) {
+                total += count;
+            }
+        }
+        return total;
+    }
+
+    private static long gcMillis() {
+        long total = 0;
+        for (GarbageCollectorMXBean bean : GC_BEANS) {
+            long time = bean.getCollectionTime();
+            if (time > 0) {
+                total += time;
+            }
+        }
+        return total;
+    }
 
     private RtFrameStats() {
     }
@@ -55,6 +84,7 @@ public final class RtFrameStats {
         private final String name;
         private final String[] stageNames;
         private final String[] counterNames;
+        private final boolean trackGc;
         private final long[] stageNanos;
         private final long[] counters;
         private final long[] history = new long[MEDIAN_WINDOW];
@@ -62,13 +92,20 @@ public final class RtFrameStats {
         private int historyPos;
         private long frameStart;
         private long frameIndex;
+        private long gcCountStart;
+        private long gcMsStart;
         private PrintWriter csv;
         private boolean csvOpenAttempted;
 
         private Profile(String name, String[] stageNames, String[] counterNames) {
+            this(name, stageNames, counterNames, false);
+        }
+
+        private Profile(String name, String[] stageNames, String[] counterNames, boolean trackGc) {
             this.name = name;
             this.stageNames = stageNames;
             this.counterNames = counterNames;
+            this.trackGc = trackGc;
             this.stageNanos = new long[stageNames.length];
             this.counters = new long[counterNames.length];
         }
@@ -81,6 +118,10 @@ public final class RtFrameStats {
             frameStart = System.nanoTime();
             Arrays.fill(stageNanos, 0L);
             Arrays.fill(counters, 0L);
+            if (trackGc) {
+                gcCountStart = gcCollections();
+                gcMsStart = gcMillis();
+            }
         }
 
         /** Time one named stage of the current frame; close the returned scope when the stage completes. */
@@ -107,6 +148,8 @@ public final class RtFrameStats {
                 return;
             }
             long total = System.nanoTime() - frameStart;
+            long gcCount = trackGc ? gcCollections() - gcCountStart : 0;
+            long gcMs = trackGc ? gcMillis() - gcMsStart : 0;
             long median = median();
             history[historyPos] = total;
             historyPos = (historyPos + 1) % MEDIAN_WINDOW;
@@ -114,9 +157,9 @@ public final class RtFrameStats {
                 historyCount++;
             }
             boolean hitch = median > 0 && total > (long) (median * HITCH_MULTIPLIER);
-            writeCsvRow(total, median, hitch);
+            writeCsvRow(total, median, hitch, gcCount, gcMs);
             if (hitch) {
-                logHitch(total, median);
+                logHitch(total, median, gcCount, gcMs);
             }
         }
 
@@ -129,7 +172,7 @@ public final class RtFrameStats {
             return sorted[historyCount / 2];
         }
 
-        private void writeCsvRow(long total, long median, boolean hitch) {
+        private void writeCsvRow(long total, long median, boolean hitch, long gcCount, long gcMs) {
             ensureCsv();
             if (csv == null) {
                 return;
@@ -141,6 +184,9 @@ public final class RtFrameStats {
             }
             for (long counter : counters) {
                 row.append(',').append(counter);
+            }
+            if (trackGc) {
+                row.append(',').append(gcCount).append(',').append(gcMs);
             }
             csv.println(row);
             csv.flush();
@@ -164,6 +210,9 @@ public final class RtFrameStats {
                 for (String counterName : counterNames) {
                     header.append(',').append(counterName);
                 }
+                if (trackGc) {
+                    header.append(",gcCount,gcPauseMs");
+                }
                 csv.println(header);
                 csv.flush();
             } catch (IOException e) {
@@ -172,14 +221,22 @@ public final class RtFrameStats {
             }
         }
 
-        private void logHitch(long total, long median) {
+        private void logHitch(long total, long median, long gcCount, long gcMs) {
             StringBuilder sb = new StringBuilder("RT hitch [").append(name).append("] ")
                     .append(ms(total)).append("ms (median ").append(ms(median)).append("ms):");
+            long staged = 0;
             for (int i = 0; i < stageNames.length; i++) {
+                staged += stageNanos[i];
                 sb.append(' ').append(stageNames[i]).append('=').append(ms(stageNanos[i])).append("ms");
             }
+            // Time inside this frame not covered by any stage timer — a big value here with gcPause>0 means
+            // a GC pause landed mid-frame; with gcPause=0 it points at an uninstrumented stage.
+            sb.append(" unaccounted=").append(ms(Math.max(0, total - staged))).append("ms");
             for (int i = 0; i < counterNames.length; i++) {
                 sb.append(' ').append(counterNames[i]).append('=').append(counters[i]);
+            }
+            if (trackGc) {
+                sb.append(" gcCount=").append(gcCount).append(" gcPauseMs=").append(gcMs);
             }
             UpscalerMod.LOGGER.info(sb.toString());
         }

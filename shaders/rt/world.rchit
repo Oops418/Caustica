@@ -232,10 +232,15 @@ void main() {
         int eidx = gl_InstanceCustomIndexEXT & ~ENTITY_BIT;
         EntityGeom g = EntityTable(pc.entityTableAddr).e[eidx];
         Prim pr = Prims(g.primAddr).p[gl_PrimitiveID];
+        // Rigid-reuse instances (still / spinning entities re-referencing a cached BLAS) carry a real
+        // rotation in the instance transform; per-frame-built entities are identity. The cached prim
+        // normal (and the TBN source positions below) are object-space — rotate them into world space.
+        // Identity/translation instances make this a no-op.
+        mat3 entityO2w = mat3(gl_ObjectToWorldEXT);
         // Orient the geometric normal toward the viewer first (so the _n TBN is built in the right
         // hemisphere — same fix as terrain).
         vec3 vdir = -gl_WorldRayDirectionEXT;
-        vec3 n = normalize(pr.normal.xyz);
+        vec3 n = normalize(entityO2w * pr.normal.xyz);
         if (dot(n, vdir) < 0.0) {
             n = -n;
         }
@@ -266,12 +271,14 @@ void main() {
             decodeSpec(texture(entitySpecTex[nonuniformEXT(texSlot)], euvCoord), albedo, rough, metal, f0, emission, sss);
         }
         if (pr.mat.w > 1.5) {
-            n = perturbNormal(n, gl_HitTriangleVertexPositionsEXT[0], gl_HitTriangleVertexPositionsEXT[1],
-                    gl_HitTriangleVertexPositionsEXT[2], euv.uv[e0], euv.uv[e1], euv.uv[e2], vdir,
+            n = perturbNormal(n, entityO2w * gl_HitTriangleVertexPositionsEXT[0],
+                    entityO2w * gl_HitTriangleVertexPositionsEXT[1],
+                    entityO2w * gl_HitTriangleVertexPositionsEXT[2], euv.uv[e0], euv.uv[e1], euv.uv[e2], vdir,
                     textureLod(blockNormalAtlas, euvCoord, 0.0), ao);
         } else if (pr.mat.w > 0.5) {
-            n = perturbNormal(n, gl_HitTriangleVertexPositionsEXT[0], gl_HitTriangleVertexPositionsEXT[1],
-                    gl_HitTriangleVertexPositionsEXT[2], euv.uv[e0], euv.uv[e1], euv.uv[e2], vdir,
+            n = perturbNormal(n, entityO2w * gl_HitTriangleVertexPositionsEXT[0],
+                    entityO2w * gl_HitTriangleVertexPositionsEXT[1],
+                    entityO2w * gl_HitTriangleVertexPositionsEXT[2], euv.uv[e0], euv.uv[e1], euv.uv[e2], vdir,
                     texture(entityNormalTex[nonuniformEXT(texSlot)], euvCoord), ao);
         }
 

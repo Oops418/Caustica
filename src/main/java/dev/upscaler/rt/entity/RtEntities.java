@@ -128,6 +128,18 @@ public final class RtEntities {
         return UpscalerConfig.Rt.Entities.REFIT.value();
     }
 
+    // Rigid reuse: when this frame's capture is a rigid transform (translation and/or yaw) of the mesh the
+    // entity's AS was last built from, reference that AS with the fitted TLAS instance transform and skip
+    // the mesh upload + refit entirely — still mobs, item frames/armor stands, and spinning/bobbing
+    // dropped items become table-entry + instance writes only. Depends on refit() (the persistent AS).
+    private static boolean rigidReuse() {
+        return UpscalerConfig.Rt.Entities.RIGID_REUSE.value();
+    }
+
+    // Max per-axis residual (blocks) for a capture to count as a rigid transform of the reference mesh.
+    // Well below a texel (1/16 block) and DLSS-RR jitter; float pose math noise is ~1e-5.
+    private static final float RIGID_FIT_EPS = 2.0e-3f;
+
     // Per-entity ring depth: a slot is reused every REFIT_RING frames, so it must be off all queues by
     // then. = KEEP_FRAMES (the established frames-in-flight-safe horizon). Each slot holds one persistent AS.
     private static final int REFIT_RING = KEEP_FRAMES;
@@ -235,11 +247,23 @@ public final class RtEntities {
     }
 
     /** A per-entity ring of {@link EntitySlot}s, cycled one-per-frame so a refit never writes an AS still
-     *  in flight, plus the last frame the entity was captured (drives eviction). */
+     *  in flight, plus the last frame the entity was captured (drives eviction). Also holds the rigid-reuse
+     *  reference: the mesh contents of the most recently written AS (in its rebased capture space) and the
+     *  cache-owned shading buffers the geometry table points at on reuse frames. */
     private static final class EntityAccel {
         final EntitySlot[] ring = new EntitySlot[REFIT_RING];
         int cursor;
         long lastSeen;
+        // Rigid-reuse reference (refAccel == null → no reusable build yet). refVerts are the exact
+        // positions the AS was last built/refit from; a frame whose capture is a rigid transform of them
+        // reuses the AS via the TLAS instance transform instead of re-uploading + refitting. Reuse frames
+        // only READ the AS, so referencing the last-written ring slot while it is in flight is safe.
+        RtAccel refAccel;
+        float[] refVerts;
+        int refVertCount = -1;
+        int refIdxCount = -1;
+        long refShadeHash;                      // rotation-invariant uv+prim hash (catches tint/sprite swaps)
+        RtBuffer refIndices, refUvs, refPrim;   // cache-owned; released when superseded or evicted
     }
 
     /** This frame's entity contribution: the full instance list (terrain + entities), the entity BLAS to
@@ -438,7 +462,11 @@ public final class RtEntities {
             // MV; rigid translation is packed into the table, deformation gets a disp buffer.
             Motion motion = uploadVertexMotion(ctx, build, capture.verts, prev, rbx, rby, rbz, "entity " + id);
             curVerts.put(id, storeEntityPrev(prev, capture.verts, rbx, rby, rbz));
-            appendCapture(ctx, build, motion, id, ENTITY_BIT, mask);
+            // Rigid reuse first: a pose that is a rigid transform of the entity's last-built mesh
+            // re-references that AS through the instance transform — no upload, no refit.
+            if (!appendRigidReuse(ctx, build, motion, id, mask)) {
+                appendCapture(ctx, build, motion, id, ENTITY_BIT, mask);
+            }
             RtFrameStats.COMPOSITE.count("entitiesCaptured", 1);
         }
         Map<Integer, EntityPrev> oldPrev = prevVerts;
@@ -891,6 +919,134 @@ public final class RtEntities {
     }
 
     /**
+     * Rigid-reuse fast path: if the current {@link #capture} is a rigid transform (translation and/or yaw
+     * rotation) of the mesh this entity's AS was last built from, emit a geometry-table entry pointing at
+     * the cached shading buffers and a TLAS instance carrying the fitted transform over the cached AS —
+     * skipping the 4 mesh uploads and the BLAS refit. Covers still mobs, item frames, armor stands, and
+     * spinning/bobbing dropped items. The hit shader rotates prim normals / TBN by the instance transform,
+     * so rotated instances shade correctly. Motion vectors are untouched: {@code motion} was already
+     * computed against last frame's capture (a rotating pose gets its per-vertex disp buffer as usual).
+     * Returns false (caller takes the full path) when there is no reusable AS, the topology changed, the
+     * pose is non-rigid (animation), or the shading data changed under identical topology.
+     */
+    private boolean appendRigidReuse(RtContext ctx, FrameBuild build, Motion motion, int entityId, int mask) {
+        if (!rigidReuse() || !refit()) {
+            return false;
+        }
+        EntityAccel ea = entityAccels.get(entityId);
+        if (ea == null || ea.refAccel == null
+                || ea.refVertCount != capture.verts.size() / 3 || ea.refIdxCount != capture.idx.size()) {
+            return false;
+        }
+        float[] xform = fitRigidTransform(ea.refVerts, capture.verts.elements(), ea.refVertCount);
+        if (xform == null) {
+            return false;
+        }
+        // Same topology + rigid pose, but tint/sprite/material lanes may still have changed (dyed sheep,
+        // item frame content swap that kept counts). Compare the rotation-invariant shading hash.
+        if (shadeHash() != ea.refShadeHash) {
+            return false;
+        }
+        beginBuildIfNeeded(ctx, build);
+        ea.lastSeen = RtComposite.frameCounter();
+        writeTableEntry(build, ea.refPrim.deviceAddress, ea.refIndices.deviceAddress, ea.refUvs.deviceAddress,
+                motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ);
+        build.instances.add(new RtAccel.Instance(xform, ea.refAccel.deviceAddress,
+                ENTITY_BIT | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
+        build.count++;
+        RtFrameStats.COMPOSITE.count("entityReuse", 1);
+        return true;
+    }
+
+    /**
+     * Fit {@code cur ≈ R_yaw·ref + t}. Returns a row-major 3x4 instance transform mapping the AS's object
+     * space (= {@code ref} as stored) onto this frame's rebased space, or null if the pose is not rigid
+     * within {@link #RIGID_FIT_EPS}. A rebase shift between the two captures shows up as a constant
+     * translation and is absorbed by the fit. Translation-only is tried first (one early-exit pass — the
+     * common still case, and animating meshes reject on the first moving vertex); then a yaw fit
+     * (dropped-item spin, minecarts). Pitch/roll and deformation take the full path.
+     */
+    private static float[] fitRigidTransform(float[] ref, float[] cur, int vc) {
+        // Pass 1: pure translation — every cur−ref delta equal.
+        float tx = cur[0] - ref[0];
+        float ty = cur[1] - ref[1];
+        float tz = cur[2] - ref[2];
+        boolean translation = true;
+        for (int i = 1; i < vc; i++) {
+            if (Math.abs((cur[i * 3]     - ref[i * 3])     - tx) > RIGID_FIT_EPS
+                    || Math.abs((cur[i * 3 + 1] - ref[i * 3 + 1]) - ty) > RIGID_FIT_EPS
+                    || Math.abs((cur[i * 3 + 2] - ref[i * 3 + 2]) - tz) > RIGID_FIT_EPS) {
+                translation = false;
+                break;
+            }
+        }
+        if (translation) {
+            return new float[] {1, 0, 0, tx, 0, 1, 0, ty, 0, 0, 1, tz};
+        }
+        // Pass 2: yaw + translation. Centroid-align, then the least-squares rotation angle about Y for
+        // x' = x·cos + z·sin, z' = −x·sin + z·cos is atan2(Σ(cx·rz − cz·rx), Σ(cx·rx + cz·rz)).
+        float crx = 0f, cry = 0f, crz = 0f, ccx = 0f, ccy = 0f, ccz = 0f;
+        for (int i = 0; i < vc; i++) {
+            crx += ref[i * 3];
+            cry += ref[i * 3 + 1];
+            crz += ref[i * 3 + 2];
+            ccx += cur[i * 3];
+            ccy += cur[i * 3 + 1];
+            ccz += cur[i * 3 + 2];
+        }
+        float inv = 1f / vc;
+        crx *= inv; cry *= inv; crz *= inv;
+        ccx *= inv; ccy *= inv; ccz *= inv;
+        double a = 0.0, b = 0.0;
+        for (int i = 0; i < vc; i++) {
+            float rx = ref[i * 3] - crx, rz = ref[i * 3 + 2] - crz;
+            float cx = cur[i * 3] - ccx, cz = cur[i * 3 + 2] - ccz;
+            a += (double) cx * rx + (double) cz * rz;
+            b += (double) cx * rz - (double) cz * rx;
+        }
+        float cos = (float) Math.cos(Math.atan2(b, a));
+        float sin = (float) Math.sin(Math.atan2(b, a));
+        for (int i = 0; i < vc; i++) {
+            float rx = ref[i * 3] - crx, ry = ref[i * 3 + 1] - cry, rz = ref[i * 3 + 2] - crz;
+            float ex = (rx * cos + rz * sin) - (cur[i * 3] - ccx);
+            float ey = ry - (cur[i * 3 + 1] - ccy);
+            float ez = (-rx * sin + rz * cos) - (cur[i * 3 + 2] - ccz);
+            if (Math.abs(ex) > RIGID_FIT_EPS || Math.abs(ey) > RIGID_FIT_EPS || Math.abs(ez) > RIGID_FIT_EPS) {
+                return null;
+            }
+        }
+        // p_out = R·(p − cr) + cc  ⇒  t = cc − R·cr.
+        float rcx = crx * cos + crz * sin;
+        float rcz = -crx * sin + crz * cos;
+        return new float[] {
+                cos, 0, sin, ccx - rcx,
+                0,   1, 0,   ccy - cry,
+                -sin, 0, cos, ccz - rcz};
+    }
+
+    /**
+     * FNV-1a over the capture's shading data that must match for AS reuse: UVs plus each prim record's
+     * emission/tint/material lanes. Prim NORMALS are deliberately excluded — they rotate with the pose,
+     * and the hit shader re-rotates the cached ones via the instance transform.
+     */
+    private long shadeHash() {
+        long h = 1469598103934665603L;
+        float[] uv = capture.uvList.elements();
+        int un = capture.uvList.size();
+        for (int i = 0; i < un; i++) {
+            h = (h ^ (Float.floatToRawIntBits(uv[i]) & 0xffffffffL)) * 1099511628211L;
+        }
+        float[] pr = capture.prim.elements();
+        int pn = capture.prim.size();
+        for (int base = 0; base < pn; base += 12) {
+            for (int k = 3; k < 12; k++) { // skip normal.xyz (0..2); keep emission(3), tint(4..7), mat(8..11)
+                h = (h ^ (Float.floatToRawIntBits(pr[base + k]) & 0xffffffffL)) * 1099511628211L;
+            }
+        }
+        return h;
+    }
+
+    /**
      * Upload the current {@link #capture} as a per-object mesh + BLAS, add its instance + geom-table entry.
      * {@code entityId} ≥ 0 → refit path (persistent updatable AS keyed by id); {@code < 0} (refit disabled)
      * → pooled full BUILD. Used by the animated-entity pass; block entities use {@link #buildBe}.
@@ -940,11 +1096,56 @@ public final class RtEntities {
 
         build.instances.add(new RtAccel.Instance(IDENTITY, accel.deviceAddress,
                 instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
-        build.buffers.add(positions);
-        build.buffers.add(indices);
-        build.buffers.add(uvs);
-        build.buffers.add(prim);
+        build.buffers.add(positions); // only this frame's BLAS build consumes positions — always per-frame
+        if (rigidReuse() && refit() && entityId >= 0) {
+            // Hand idx/uv/prim to the entity's rigid-reuse cache (later reuse frames keep reading them via
+            // the geometry table) and snapshot the verts this AS now contains as the fit reference.
+            EntityAccel ea = entityAccels.get(entityId); // created by refitOrBuild above
+            releaseRefBuffers(ea);
+            ea.refAccel = accel;
+            ea.refIndices = indices;
+            ea.refUvs = uvs;
+            ea.refPrim = prim;
+            int size = capture.verts.size();
+            if (ea.refVerts == null || ea.refVerts.length < size) {
+                ea.refVerts = new float[size];
+            }
+            System.arraycopy(capture.verts.elements(), 0, ea.refVerts, 0, size);
+            ea.refVertCount = vertCount;
+            ea.refIdxCount = idxCount;
+            ea.refShadeHash = shadeHash();
+        } else {
+            build.buffers.add(indices);
+            build.buffers.add(uvs);
+            build.buffers.add(prim);
+        }
         build.count++;
+    }
+
+    /** Defer-release an entity's superseded rigid-reuse cache buffers (in-flight frames may still read them). */
+    private void releaseRefBuffers(EntityAccel ea) {
+        RtBuffer idx = ea.refIndices;
+        RtBuffer uv = ea.refUvs;
+        RtBuffer pr = ea.refPrim;
+        ea.refAccel = null;
+        ea.refIndices = null;
+        ea.refUvs = null;
+        ea.refPrim = null;
+        if (idx == null && uv == null && pr == null) {
+            return;
+        }
+        long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
+        deferred.add(new Deferred(freeAt, () -> {
+            if (idx != null) {
+                pool.release(idx);
+            }
+            if (uv != null) {
+                pool.release(uv);
+            }
+            if (pr != null) {
+                pool.release(pr);
+            }
+        }));
     }
 
     /** Upload a per-vertex displacement array to a pooled per-frame buffer; returns its address (0 if null). */
@@ -1045,7 +1246,25 @@ public final class RtEntities {
                     slot.backing = null;
                 }
             }
+            releaseCacheBuffersNow(ea); // unseen ≥ KEEP_FRAMES ⇒ off all queues
             it.remove();
+        }
+    }
+
+    /** Immediately return an evicted entity's rigid-reuse cache buffers to the pool (already off-queue). */
+    private void releaseCacheBuffersNow(EntityAccel ea) {
+        ea.refAccel = null;
+        if (ea.refIndices != null) {
+            pool.release(ea.refIndices);
+            ea.refIndices = null;
+        }
+        if (ea.refUvs != null) {
+            pool.release(ea.refUvs);
+            ea.refUvs = null;
+        }
+        if (ea.refPrim != null) {
+            pool.release(ea.refPrim);
+            ea.refPrim = null;
         }
     }
 
@@ -1115,6 +1334,7 @@ public final class RtEntities {
                     slot.backing = null;
                 }
             }
+            releaseCacheBuffersNow(ea); // runs after waitIdle — immediate release is safe
         }
         entityAccels.clear();
         for (BeEntry e : beCache.values()) {

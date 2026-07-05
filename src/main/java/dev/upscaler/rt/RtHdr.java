@@ -48,8 +48,8 @@ public final class RtHdr {
     /** Logs the resolved HDR config once (cheap; safe to call repeatedly — guarded by the surface log). */
     public static void logConfig() {
         UpscalerMod.LOGGER.info(
-                "HDR config: mode={} forceSdr={} paperWhite={}nits peak={}nits -> {} (headroom={})",
-                UpscalerConfig.Rt.Hdr.MODE.get(), UpscalerConfig.Rt.Hdr.FORCE_SDR.value(),
+                "HDR config: enabled={} paperWhite={}nits peak={}nits -> {} (headroom={})",
+                UpscalerConfig.Rt.Hdr.ENABLED.value(),
                 UpscalerConfig.Rt.Hdr.PAPER_WHITE_NITS.value(), UpscalerConfig.Rt.Hdr.PEAK_NITS.value(),
                 UpscalerConfig.Rt.Hdr.enabled() ? "HDR display path active" : "SDR display path",
                 UpscalerConfig.Rt.Hdr.headroom());

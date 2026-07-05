@@ -72,13 +72,8 @@ public final class RtUiOverlay {
      * core/screenquad"). Gating the redirect here keeps the loading-screen GUI on the normal path.
      */
     public static boolean enabled() {
-        return (UpscalerConfig.Rt.Hdr.UI_OVERLAY.value() || hdrUiActive())
+        return UpscalerConfig.Rt.Hdr.enabled()
                 && !compositeFailed && Minecraft.getInstance().isGameLoadFinished();
-    }
-
-    /** HDR present mode: the UI must go through the overlay since the SDR main target isn't presented. */
-    private static boolean hdrUiActive() {
-        return UpscalerConfig.Rt.Hdr.PQ_SWAPCHAIN.value() && UpscalerConfig.Rt.Hdr.enabled();
     }
 
     /** Whether the overlay holds this frame's UI (for the HDR present path to composite + consume). */

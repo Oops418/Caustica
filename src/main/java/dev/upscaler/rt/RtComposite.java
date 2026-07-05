@@ -1110,8 +1110,7 @@ public final class RtComposite {
 
     /** Whether the world-only HDR present (HDR image -> PQ swapchain) should replace the vanilla SDR blit. */
     public boolean isHdrPresentActive() {
-        return UpscalerConfig.Rt.Hdr.PQ_SWAPCHAIN.value()
-                && UpscalerConfig.Rt.Hdr.enabled()
+        return UpscalerConfig.Rt.Hdr.enabled()
                 && hdrWrittenThisFrame
                 && hdrDisplayImage != null;
     }
@@ -1252,8 +1251,7 @@ public final class RtComposite {
      * not produce an HDR image ({@link #isHdrPresentActive()} false).
      */
     public boolean isPqSdrPresentActive() {
-        return UpscalerConfig.Rt.Hdr.PQ_SWAPCHAIN.value()
-                && UpscalerConfig.Rt.Hdr.enabled()
+        return UpscalerConfig.Rt.Hdr.enabled()
                 && !isHdrPresentActive();
     }
 

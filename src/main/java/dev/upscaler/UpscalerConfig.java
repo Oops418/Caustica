@@ -59,7 +59,7 @@ public final class UpscalerConfig {
             Rt.ENABLED, Rt.Composite.ENABLED, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.BufferPool.STATS, Rt.FrameStats.ENABLED,
-            Rt.Hdr.MODE, Ngx.PATH,
+            Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
 
@@ -103,10 +103,9 @@ public final class UpscalerConfig {
                 " NVIDIA Reflex (VK_NV_low_latency2). Default off; gated additionally by device support.\n"
                         + " minimum-interval-us: 0 = no framerate cap (Reflex just paces submission).");
         FILE.setComment("hdr",
-                " HDR display output. mode selects the presentation convention: off keeps the SDR AgX path,\n"
-                        + " pq targets ST.2084/PQ (required by HDR10 swapchains and Frame Generation), auto picks\n"
-                        + " PQ when the swapchain supports it. force-sdr pins SDR even when a mode is selected.\n"
-                        + " paper-white-nits / peak-nits drive the scene-HDR -> display mapping.");
+                " HDR display output (ST.2084/PQ). When enabled the swapchain is created in PQ automatically\n"
+                        + " (falls back to SDR if the surface doesn't advertise it). paper-white-nits / peak-nits\n"
+                        + " drive the scene-HDR -> display mapping.");
     }
 
     private static Path resolveConfigPath() {
@@ -524,8 +523,6 @@ public final class UpscalerConfig {
     public static final class Rt {
         public static final BooleanSetting ENABLED = bool("upscaler.rt", "enabled", true);
         public static final StringSetting OUTPUT_MODE = string("upscaler.rt.output", "output", "rt", Rt::sanitizeOutputMode);
-        public static final BooleanSetting CANCEL_VANILLA_WORLD =
-                bool("upscaler.rt.cancelVanillaWorld", "cancel-vanilla-world.enabled", false);
         public static final BooleanSetting CANCEL_VANILLA_WORLD_LOG =
                 bool("upscaler.rt.cancelVanillaWorld.log", "cancel-vanilla-world.log", true);
         public static final BooleanSetting PBR = bool("upscaler.rt.pbr", "pbr", true);
@@ -546,7 +543,7 @@ public final class UpscalerConfig {
             public static final FloatSetting MOON_ANGULAR_RADIUS =
                     radians("upscaler.rt.moonAngularRadius", "composite.moon-angular-radius-deg", 1.5f);
             public static final FloatSetting SUN_NOON_SOUTH_TILT =
-                    radians("upscaler.rt.sunNoonSouthDeg", "composite.sun-noon-south-tilt-deg", 0.0f);
+                    radians("upscaler.rt.sunNoonSouthDeg", "composite.sun-noon-south-tilt-deg", 30.0f);
             public static final FloatSetting JITTER_SIGN_X =
                     finiteFloat("upscaler.rt.jitterSignX", "composite.jitter-sign-x", 1.0f);
             public static final FloatSetting JITTER_SIGN_Y =
@@ -633,7 +630,7 @@ public final class UpscalerConfig {
         }
 
         public static final class DlssRr {
-            public static final BooleanSetting ENABLED = bool("upscaler.rt.dlssRr", "dlss-rr.enabled", false);
+            public static final BooleanSetting ENABLED = bool("upscaler.rt.dlssRr", "dlss-rr.enabled", true);
             public static final IntSetting PRESET = intValue("upscaler.rt.dlssRr.preset", "dlss-rr.preset", 0);
             public static final IntSetting QUALITY = intValue("upscaler.rt.dlssRr.quality", "dlss-rr.quality", 0);
 
@@ -675,9 +672,9 @@ public final class UpscalerConfig {
                     finiteFloat("upscaler.rt.exposure.manualEv", "exposure.manual-ev", 0.0f);
             public static final FloatSetting KEY = exposureScale("upscaler.rt.exposure.key", "exposure.key", 0.18f);
             public static final FloatSetting MIN_EV =
-                    finiteFloat("upscaler.rt.exposure.minEv", "exposure.min-ev", -0.5f);
+                    finiteFloat("upscaler.rt.exposure.minEv", "exposure.min-ev", -1.0f);
             public static final FloatSetting MAX_EV =
-                    finiteFloat("upscaler.rt.exposure.maxEv", "exposure.max-ev", 2.5f);
+                    finiteFloat("upscaler.rt.exposure.maxEv", "exposure.max-ev", 2.0f);
             public static final FloatSetting ADAPT_UP =
                     exposureScale("upscaler.rt.exposure.adaptUp", "exposure.adapt-up", 0.12f);
             public static final FloatSetting ADAPT_DOWN =
@@ -725,42 +722,25 @@ public final class UpscalerConfig {
         }
 
         /**
-         * HDR display output. {@code mode} selects the presentation convention: {@code off} keeps the SDR
-         * AgX path, {@code pq} targets ST.2084/PQ (the display-ready encoding both HDR10 swapchains and DLSS
-         * Frame Generation require), {@code auto} picks PQ when the swapchain supports it. {@code forceSdr}
-         * is a debug override that pins SDR even when a mode is selected. The nit values drive the
-         * scene-HDR → display mapping: SDR paper white maps to {@code paperWhiteNits}, and highlights roll
-         * off toward {@code peakNits}.
+         * HDR display output. When enabled the swapchain is created in PQ (ST.2084/HDR10 — the display-ready
+         * encoding both HDR10 swapchains and DLSS Frame Generation require; whatever pixel format the surface
+         * pairs with that color space, commonly a 10-bit UNORM), falling back to SDR if the surface doesn't
+         * advertise it. The nit values drive the scene-HDR → display mapping: SDR paper white maps to
+         * {@code paperWhiteNits}, and highlights roll off toward {@code peakNits}.
          */
         public static final class Hdr {
-            public static final StringSetting MODE = string("upscaler.rt.hdr.mode", "hdr.mode", "off", Hdr::sanitizeMode);
+            public static final BooleanSetting ENABLED = bool("upscaler.rt.hdr", "hdr.enabled", false);
             public static final FloatSetting PAPER_WHITE_NITS =
                     clampedFloat("upscaler.rt.hdr.paperWhiteNits", "hdr.paper-white-nits", 200.0f, 80.0f, 1000.0f);
             public static final FloatSetting PEAK_NITS =
                     clampedFloat("upscaler.rt.hdr.peakNits", "hdr.peak-nits", 1000.0f, 80.0f, 10000.0f);
-            public static final BooleanSetting FORCE_SDR =
-                    bool("upscaler.rt.hdr.forceSdr", "hdr.force-sdr", false);
-            /**
-             * Phase 2 step A: render the vanilla GUI/HUD into a separate transparent overlay target and
-             * composite it back over the world. Default off. In SDR this should look identical to vanilla; it
-             * is the prerequisite for keeping UI out of the world tonemap once HDR presentation lands.
-             */
-            public static final BooleanSetting UI_OVERLAY =
-                    bool("upscaler.rt.hdr.uiOverlay", "hdr.ui-overlay", false);
-            /**
-             * Create Minecraft's swapchain in PQ (ST.2084/HDR10, whatever pixel format the surface pairs with
-             * that color space — commonly a 10-bit UNORM) instead of SDR, when the surface advertises it.
-             * Default off, falls back to SDR when unavailable.
-             */
-            public static final BooleanSetting PQ_SWAPCHAIN =
-                    bool("upscaler.rt.hdr.pqSwapchain", "hdr.pq-swapchain", false);
 
             private Hdr() {
             }
 
-            /** Whether the HDR display path should be active (a mode is selected and SDR isn't forced). */
+            /** Whether the HDR display path (world HDR + PQ swapchain + UI overlay) should be active. */
             public static boolean enabled() {
-                return !FORCE_SDR.value() && !"off".equals(MODE.get());
+                return ENABLED.value();
             }
 
             /** Absolute nits SDR paper white maps to in the PQ encode (ST.2084 is referenced to 10000 nits). */
@@ -771,13 +751,6 @@ public final class UpscalerConfig {
             /** Highlight headroom above paper white, in paper-white-referred units ({@code >= 1}). */
             public static float headroom() {
                 return Math.max(1.0f, PEAK_NITS.value() / Math.max(1.0f, PAPER_WHITE_NITS.value()));
-            }
-
-            private static String sanitizeMode(String value) {
-                if ("pq".equalsIgnoreCase(value) || "auto".equalsIgnoreCase(value)) {
-                    return value.toLowerCase();
-                }
-                return "off";
             }
         }
 

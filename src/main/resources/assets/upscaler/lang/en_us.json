@@ -24,6 +24,15 @@
 	"upscaler.options.rt.waterWaves": "Animated Water",
 	"upscaler.options.rt.waterWaves.tooltip": "Animate water-surface normals for moving wave highlights.",
 
+	"upscaler.options.rt.hdr": "HDR Output",
+	"upscaler.options.rt.hdr.tooltip": "Present in HDR (ST.2084/PQ) instead of SDR, when the display supports it. Takes effect after restarting the game.",
+
+	"upscaler.options.rt.hdrPaperWhite": "HDR Paper White",
+	"upscaler.options.rt.hdrPaperWhite.tooltip": "Absolute brightness (in nits) that SDR-equivalent scene brightness maps to on an HDR display.",
+
+	"upscaler.options.rt.hdrPeak": "HDR Peak Brightness",
+	"upscaler.options.rt.hdrPeak.tooltip": "Absolute brightness (in nits) highlights roll off toward. Set to your display's peak HDR brightness.",
+
 	"upscaler.options.rt.dlssQuality": "DLSS Quality",
 	"upscaler.options.rt.dlssQuality.tooltip": "DLSS Ray Reconstruction quality mode. Lower-quality modes render fewer pixels and upscale more aggressively for higher framerates; higher-quality modes render more pixels for a sharper image. Only affects the image when DLSS Ray Reconstruction is enabled.",
 	"upscaler.options.rt.dlssQuality.3": "Ultra Performance",

@@ -53,7 +53,7 @@ public final class VanillaRenderController {
 			UpscalerMod.LOGGER.info("RT output mode: {}", this.outputMode == OutputMode.RT ? "rt" : "vanilla");
 		}
 
-		if (!cancelWorld() || this.outputMode == OutputMode.VANILLA) {
+		if (this.outputMode == OutputMode.VANILLA) {
 			return;
 		}
 
@@ -78,9 +78,6 @@ public final class VanillaRenderController {
 	}
 
 	public boolean shouldCancelLevelRenderer(boolean waitingForRtPlayerSection) {
-		if (!cancelWorld()) {
-			return false;
-		}
 		if (this.outputMode == OutputMode.VANILLA) {
 			return false;
 		}
@@ -198,10 +195,6 @@ public final class VanillaRenderController {
 
 	private static OutputMode readOutputMode() {
 		return OutputMode.parse(UpscalerConfig.Rt.OUTPUT_MODE.get());
-	}
-
-	private static boolean cancelWorld() {
-		return UpscalerConfig.Rt.CANCEL_VANILLA_WORLD.value();
 	}
 
 	private static boolean logEnabled() {

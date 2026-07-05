@@ -116,7 +116,7 @@ public abstract class VulkanGpuSurfaceMixin {
 	 */
 	@Inject(method = "pickSwapchainSurfaceFormat", at = @At("HEAD"), cancellable = true)
 	private void upscaler$pickPqFormat(VkSurfaceFormatKHR.Buffer formats, CallbackInfoReturnable<VkSurfaceFormatKHR> cir) {
-		if (!UpscalerConfig.Rt.Hdr.PQ_SWAPCHAIN.value()) {
+		if (!UpscalerConfig.Rt.Hdr.enabled()) {
 			return;
 		}
 		for (int i = 0; i < formats.capacity(); i++) {

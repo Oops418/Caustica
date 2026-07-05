@@ -40,6 +40,9 @@ public final class RtVideoOptions {
             particles(),
             waterWaves(),
             dlssQuality(),
+            hdrEnabled(),
+            hdrPaperWhite(),
+            hdrPeak(),
             debugView(),
         };
     }
@@ -127,6 +130,32 @@ public final class RtVideoOptions {
             new OptionInstance.IntRange(0, DLSS_QUALITY_ORDER.size() - 1),
             initialPosition,
             position -> setting.set(DLSS_QUALITY_ORDER.get(position)));
+    }
+
+    private static OptionInstance<Boolean> hdrEnabled() {
+        return bool("upscaler.options.rt.hdr", UpscalerConfig.Rt.Hdr.ENABLED);
+    }
+
+    private static OptionInstance<Integer> hdrPaperWhite() {
+        FloatSetting setting = UpscalerConfig.Rt.Hdr.PAPER_WHITE_NITS;
+        return new OptionInstance<>(
+            "upscaler.options.rt.hdrPaperWhite",
+            OptionInstance.cachedConstantTooltip(Component.translatable("upscaler.options.rt.hdrPaperWhite.tooltip")),
+            (caption, nits) -> Options.genericValueLabel(caption, Component.literal(nits + " nits")),
+            new OptionInstance.IntRange(80, 1000),
+            Math.clamp(Math.round(setting.value()), 80, 1000),
+            nits -> setting.set(nits.floatValue()));
+    }
+
+    private static OptionInstance<Integer> hdrPeak() {
+        FloatSetting setting = UpscalerConfig.Rt.Hdr.PEAK_NITS;
+        return new OptionInstance<>(
+            "upscaler.options.rt.hdrPeak",
+            OptionInstance.cachedConstantTooltip(Component.translatable("upscaler.options.rt.hdrPeak.tooltip")),
+            (caption, nits) -> Options.genericValueLabel(caption, Component.literal(nits + " nits")),
+            new OptionInstance.IntRange(80, 10000),
+            Math.clamp(Math.round(setting.value()), 80, 10000),
+            nits -> setting.set(nits.floatValue()));
     }
 
     private static OptionInstance<Integer> debugView() {

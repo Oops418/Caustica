@@ -369,6 +369,10 @@ public final class RtComposite {
                 }
             }
             ensureOutput(ctx, width, height);
+            // Cheap idempotent check every frame (not just on resize): if the exposure mode is switched
+            // manual -> auto at runtime (video settings), the auto-mode histogram/state/pipeline must be
+            // allocated before recordFrame's exposure.record() below needs them, or it throws.
+            exposure.ensureResources(ctx);
             refreshPipelineShapeIfNeeded(ctx);
             RtPipeline active = ensureWorld(ctx);
             refreshMaterialBindingsIfNeeded(ctx);

@@ -62,7 +62,7 @@ public final class RtExposure {
         }
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure manual write")) {
             VkClearColorValue color = VkClearColorValue.calloc(stack);
-            color.float32(0, exposureScale());
+            color.float32(0, manualExposureScale());
             VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack);
             range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
                     .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
@@ -89,11 +89,10 @@ public final class RtExposure {
         }
     }
 
-    private float exposureScale() {
-        return switch (mode()) {
-            case MANUAL -> UpscalerConfig.Rt.Exposure.clampScale((float) Math.pow(2.0, manualEv()));
-            case AUTO -> UpscalerConfig.Rt.Exposure.clampScale((float) Math.pow(2.0, manualEv()));
-        };
+    // Manual mode's exposure scale, also used as the auto-history seed (resetAutoHistory) so the very
+    // first auto-exposure frame starts from the dialed-in EV bias instead of a bare 1.0.
+    private float manualExposureScale() {
+        return UpscalerConfig.Rt.Exposure.clampScale((float) Math.pow(2.0, manualEv()));
     }
 
     private void recordAuto(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor) {
@@ -122,7 +121,7 @@ public final class RtExposure {
         if (state == null || state.mapped == 0L) {
             return;
         }
-        MemoryUtil.memPutFloat(state.mapped, exposureScale());
+        MemoryUtil.memPutFloat(state.mapped, manualExposureScale());
         MemoryUtil.memPutInt(state.mapped + 4, 0);
         lastFrameNanos = 0L;
     }
@@ -138,7 +137,7 @@ public final class RtExposure {
                 ? "auto(key=" + autoConfig.key + ", minEv=" + autoConfig.minEv + ", maxEv=" + autoConfig.maxEv
                 + ", adaptUp=" + autoConfig.adaptUp + ", adaptDown=" + autoConfig.adaptDown
                 + ", evBias=" + autoConfig.evBias + ")"
-                : Float.toString(exposureScale());
+                : Float.toString(manualExposureScale());
         UpscalerMod.LOGGER.info("RT display exposure: mode={}, exposure={}, tonemap=agx, DLSS-RR exposure=NGX auto",
                 mode.configName, exposureText);
     }

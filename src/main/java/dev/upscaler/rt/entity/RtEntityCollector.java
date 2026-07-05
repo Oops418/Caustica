@@ -4,11 +4,13 @@ import com.mojang.blaze3d.pipeline.ColorTargetState;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.QuadInstance;
+import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.upscaler.mixin.RenderSetupAccessor;
 import dev.upscaler.mixin.RenderTypeAccessor;
 import net.fabricmc.fabric.api.client.rendering.v1.SubmitRenderPhase;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
+import net.minecraft.client.gui.font.TextRenderable;
 import net.minecraft.client.model.Model;
 import net.minecraft.client.renderer.OrderedSubmitNodeCollector;
 import net.minecraft.client.renderer.SubmitNodeCollector;
@@ -31,6 +33,7 @@ import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
+import net.minecraft.util.ARGB;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.world.item.ItemDisplayContext;
 import net.minecraft.world.phys.Vec3;
@@ -62,6 +65,11 @@ public final class RtEntityCollector implements SubmitNodeCollector {
 
     private RtEntityCapture capture;
     private ModelBlockRenderer blockRenderer; // lazily-built mesher for moving (falling) blocks
+    // Set by order(int) for the very next submitModel call (banner/shield pattern-layer stacking), then
+    // consumed. Baked-quad paths (addQuad) don't use ordering and always reset the capture's order to 0.
+    private int pendingOrder;
+    private final RtTextVertexConsumer textVertexConsumer = new RtTextVertexConsumer();
+    private final TextGlyphVisitor textGlyphVisitor = new TextGlyphVisitor();
 
     /** Point the collector at the capture buffer for the next {@code dispatcher.submit}. */
     public void begin(RtEntityCapture capture) {
@@ -75,6 +83,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        capture.currentOrder = pendingOrder; // banner/shield pattern-layer stacking rank; consumed once
+        pendingOrder = 0;
         // Resolve this submission's texture to a bindless slot; the capture stamps it on every prim.
         // Block-entity models (chests/signs/beds) texture from an atlas SPRITE: use that atlas + remap
         // the ModelPart 0..1 UVs into the sprite's region. Mobs use a full texture (sprite == null).
@@ -115,7 +125,11 @@ public final class RtEntityCollector implements SubmitNodeCollector {
 
     @Override
     public OrderedSubmitNodeCollector order(int order) {
-        return this; // single un-ordered capture sink — ordering is irrelevant for geometry extraction
+        // Single un-ordered capture sink reused synchronously (no queuing): the caller always issues the
+        // very next submission immediately after requesting an order, so stashing it for that one
+        // submitModel call (see there) is enough to recover banner/shield pattern-layer stacking.
+        pendingOrder = order;
+        return this;
     }
 
     /** Capture a list of baked quads (items / block models), each textured from its sprite's atlas. */
@@ -133,6 +147,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                 : 0;
         setBlockMaterial(sprite); // block-atlas sprites (block items/falling/contained blocks) → terrain _s/_n
         capture.currentTranslucent = false; // block/item geometry is opaque (the inner content we want solid)
+        capture.currentOrder = 0; // baked-quad paths never stack decal layers
         capture.addBakedQuad(pose, q, tintColor(q.materialInfo().tintIndex(), tintLayers));
     }
 
@@ -228,9 +243,121 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                               boolean seeThrough, int lightCoords, CameraRenderState camera) {
     }
 
+
+    // Sign text (AbstractSignRenderer) and any other in-world text (maps, …) land here. Mirrors
+    // TextFeatureRenderer.buildGroup's own flush path exactly (same Font.prepareText/prepare8xTextOutline
+    // + GlyphVisitor calls) but visits glyphs straight into the capture instead of a real vertex buffer,
+    // so sign text gets real ray-traced geometry instead of being dropped.
     @Override
     public void submitText(PoseStack poseStack, float x, float y, FormattedCharSequence string, boolean dropShadow,
                            Font.DisplayMode displayMode, int lightCoords, int color, int backgroundColor, int outlineColor) {
+        if (capture == null) {
+            return;
+        }
+        Matrix4f pose = poseStack.last().pose();
+        Font font = Minecraft.getInstance().font;
+        textGlyphVisitor.pose = pose;
+        textGlyphVisitor.lightCoords = lightCoords;
+        if (outlineColor == 0) {
+            textGlyphVisitor.displayMode = displayMode;
+            font.prepareText(string, x, y, color, dropShadow, false, backgroundColor).visit(textGlyphVisitor);
+        } else {
+            // Same two-pass outline technique as vanilla: an 8-directional expanded copy first (flat,
+            // NORMAL), then the real text on top with a polygon-offset display mode so it doesn't z-fight
+            // the outline it's sitting on.
+            Font.PreparedText outline = font.prepare8xTextOutline(string, x, y, outlineColor);
+            Font.PreparedText text = font.prepareText(string, x, y, color, false, false, 0);
+            textGlyphVisitor.displayMode = Font.DisplayMode.NORMAL;
+            outline.visit(textGlyphVisitor);
+            textGlyphVisitor.displayMode = Font.DisplayMode.POLYGON_OFFSET;
+            text.visit(textGlyphVisitor);
+        }
+    }
+
+    /** Resolves each glyph's render type to a bindless slot and renders it into {@link #textVertexConsumer}. */
+    private final class TextGlyphVisitor implements Font.GlyphVisitor {
+        Matrix4f pose;
+        int lightCoords;
+        Font.DisplayMode displayMode;
+
+        @Override
+        public void acceptRenderable(TextRenderable renderable) {
+            RenderType renderType = renderable.renderType(displayMode);
+            capture.currentTexSlot = RtEntityTextures.INSTANCE.slotFor(renderType);
+            capture.currentHasS = false;
+            capture.currentHasN = false;
+            capture.currentBlockAtlas = false;
+            capture.currentTranslucent = isTranslucent(renderType); // AA glyph edges → stochastic alpha
+            capture.currentOrder = 0;
+            capture.clearUvRemap(); // glyph U/V are already atlas-space
+            renderable.render(pose, textVertexConsumer, lightCoords, false);
+        }
+    }
+
+    /**
+     * Adapts the builder-style {@link VertexConsumer} calls glyph rendering makes ({@code
+     * addVertex(pose,x,y,z).setColor(c).setUv(u,v).setLight(light)}) into {@link RtEntityCapture}'s bulk
+     * {@code addVertex}. {@code setUv2} (light, via the default {@code setLight}) is always the last call
+     * per vertex in {@code BakedSheetGlyph}, so committing there is safe — no vertex is ever left pending.
+     */
+    private final class RtTextVertexConsumer implements VertexConsumer {
+        private float vx, vy, vz;
+        private int vColor = -1;
+        private float vu, vv;
+
+        @Override
+        public VertexConsumer addVertex(float x, float y, float z) {
+            vx = x;
+            vy = y;
+            vz = z;
+            vColor = -1;
+            vu = 0f;
+            vv = 0f;
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setColor(int r, int g, int b, int a) {
+            vColor = ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setColor(int color) {
+            vColor = color;
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setUv(float u, float v) {
+            vu = u;
+            vv = v;
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setUv1(int u, int v) {
+            return this; // overlay unused by the capture
+        }
+
+        @Override
+        public VertexConsumer setUv2(int lightU, int lightV) {
+            // Inverts VertexConsumer#setLight's default packing; light itself is unused by the capture
+            // (entities are fully path-traced), so any value round-trips fine.
+            int light = (lightU & 0xFFFF) | (lightV << 16);
+            capture.addVertex(vx, vy, vz, vColor, vu, vv, 0, light, 0f, 0f, 0f);
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setNormal(float x, float y, float z) {
+            return this; // planar glyph quad → emitQuad's geometric fallback is exact
+        }
+
+        @Override
+        public VertexConsumer setLineWidth(float width) {
+            return this;
+        }
     }
 
     @Override
@@ -266,6 +393,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                 capture.currentTexSlot = slot;
                 setBlockMaterial(quad.materialInfo().sprite()); // block-atlas sprite → terrain _s/_n (mat code 2)
                 capture.currentTranslucent = false; // falling blocks are opaque
+                capture.currentOrder = 0; // baked-quad paths never stack decal layers
                 capture.addBakedQuad(pose, quad, -1); // white tint (falling blocks rarely biome-tinted)
             }
         };

@@ -21,6 +21,9 @@ import org.joml.Vector3fc;
  */
 public final class RtEntityCapture implements VertexConsumer {
     private static final int DEFAULT_VERTEX_CAPACITY = 1024;
+    // Same magnitude as RtTerrain.QuadCapture.OFFSET (2e-4 blocks) — proven large enough to break a BVH
+    // depth tie without a visible gap at terrain/entity scale.
+    private static final float ORDER_OFFSET = 2.0e-4f;
 
     final FloatArrayList verts = new FloatArrayList(DEFAULT_VERTEX_CAPACITY * 3);   // 3 floats/vertex (capture-space position)
     final IntArrayList idx = new IntArrayList(indexCapacity(DEFAULT_VERTEX_CAPACITY)); // 3 indices/triangle
@@ -46,6 +49,9 @@ public final class RtEntityCapture implements VertexConsumer {
     // content (slime core, the sulfur cube's contained block) shows through the shell. Set by the collector
     // per submission (model bodies only — block/item/particle paths force it false).
     boolean currentTranslucent;
+    // Decal-stacking rank for the current submission (0 = no offset). Set by the collector from
+    // SubmitNodeCollector#order(int) — see emitQuad's coincident-layer push.
+    int currentOrder;
     // When a model textures from an atlas sprite (block entities: chests/signs/beds via a Material),
     // its ModelPart UVs are 0..1 in a virtual texture and must be remapped into the sprite's atlas
     // region — the work vanilla's sprite-coordinate-expander VertexConsumer does, which we bypass.
@@ -78,6 +84,7 @@ public final class RtEntityCapture implements VertexConsumer {
         currentHasN = false;
         currentBlockAtlas = false;
         currentTranslucent = false;
+        currentOrder = 0;
         uvRemap = false;
     }
 
@@ -160,24 +167,10 @@ public final class RtEntityCapture implements VertexConsumer {
     }
 
     private void emitQuad() {
-        int base = verts.size() / 3;
-        for (int i = 0; i < 4; i++) {
-            verts.add(qx[i]);
-            verts.add(qy[i]);
-            verts.add(qz[i]);
-            uvList.add(qu[i]);
-            uvList.add(qv[i]);
-        }
-        idx.add(base);
-        idx.add(base + 1);
-        idx.add(base + 2);
-        idx.add(base);
-        idx.add(base + 2);
-        idx.add(base + 3);
-
         // Authored model normal (pose-transformed by compile); planar quad, so vertex 0's normal is the
         // face normal. Baked quads (items/blocks) pass no normal → fall back to a geometric one from the
-        // quad edges. The closest-hit flips it toward the viewer, as for terrain.
+        // quad edges. The closest-hit flips it toward the viewer, as for terrain. Computed BEFORE the
+        // positions are staged so a same-order offset (below) can push along it.
         float nx = qnx[0], ny = qny[0], nz = qnz[0];
         float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
         if (len <= 1.0e-6f) {
@@ -193,6 +186,34 @@ public final class RtEntityCapture implements VertexConsumer {
             ny /= len;
             nz /= len;
         }
+        // Stacked decal layers (banner/shield patterns: base cloth + per-pattern cutout layers, all the
+        // SAME coplanar mesh submitted repeatedly via SubmitNodeCollector#order) tie exactly in the BVH —
+        // push each later layer outward along the face normal by rank, same fix as terrain's coincident
+        // grass-overlay resolution (RtTerrain.QuadCapture), so any-hit cutout lets the ray fall through a
+        // discarded pattern texel to the layer behind instead of a random BVH pick.
+        if (currentOrder != 0 && len > 1.0e-6f) {
+            float off = ORDER_OFFSET * currentOrder;
+            for (int i = 0; i < 4; i++) {
+                qx[i] += nx * off;
+                qy[i] += ny * off;
+                qz[i] += nz * off;
+            }
+        }
+
+        int base = verts.size() / 3;
+        for (int i = 0; i < 4; i++) {
+            verts.add(qx[i]);
+            verts.add(qy[i]);
+            verts.add(qz[i]);
+            uvList.add(qu[i]);
+            uvList.add(qv[i]);
+        }
+        idx.add(base);
+        idx.add(base + 1);
+        idx.add(base + 2);
+        idx.add(base);
+        idx.add(base + 2);
+        idx.add(base + 3);
         // Vertex colour as a flat per-prim tint (ARGB → rgb). White (-1) for most models → grey when lit.
         int c = qcol[0];
         float tr = ((c >> 16) & 0xFF) * (1f / 255f);

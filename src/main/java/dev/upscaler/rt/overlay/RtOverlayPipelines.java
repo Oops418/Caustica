@@ -79,8 +79,30 @@ public final class RtOverlayPipelines {
     public enum Blend {
         /** Straight replace (mask writes). */
         NONE,
-        /** Classic alpha blend: SRC_ALPHA / ONE_MINUS_SRC_ALPHA, destination alpha preserved. */
-        ALPHA
+        /**
+         * Standard "over" operator for a STRAIGHT-alpha (non-premultiplied) fragment shader output —
+         * {@code SRC_ALPHA / ONE_MINUS_SRC_ALPHA} on colour, correctly-accumulating alpha on the alpha
+         * channel. Every current feature (glow, name tags, block outline's own mask bridge) outputs
+         * straight colour, so this is what they use to draw onto {@link RtWorldOverlay}'s shared buffer.
+         * <p><b>Important:</b> applying this blend repeatedly across MULTIPLE layers drawn onto an
+         * initially-transparent destination does NOT leave that destination holding straight-alpha values —
+         * {@code dstRGB*(1-srcA)} decaying an already-scaled destination is exactly the premultiplied "over"
+         * recipe, so the shared buffer ends up PREMULTIPLIED (`rgb = trueColour * accumulatedAlpha`) after
+         * more than one layer, even though every individual draw's OWN fragment output was straight. Anyone
+         * reading the shared buffer back as a SOURCE (not drawing straight colour onto it) must treat it as
+         * premultiplied — see {@link #PREMULTIPLIED_ALPHA} and {@code hdr_world_overlay_composite.comp}'s
+         * un-premultiply step.
+         */
+        ALPHA,
+        /**
+         * Standard premultiplied "over" operator — {@code ONE / ONE_MINUS_SRC_ALPHA} on colour (the
+         * fragment shader's own rgb is used as-is, NOT re-multiplied by its alpha) — for compositing a
+         * SOURCE that already holds premultiplied content, e.g. {@link RtWorldOverlay}'s shared overlay
+         * buffer (see {@link #ALPHA}'s doc) blended onto the real presented image. Using {@link #ALPHA}
+         * here instead would double-multiply by alpha (dimmed/incorrect colour on anything semi-
+         * transparent) since the source is already scaled.
+         */
+        PREMULTIPLIED_ALPHA
     }
 
     /** A pipeline plus its layout, destroyed together. */
@@ -215,12 +237,28 @@ public final class RtOverlayPipelines {
                     VK10.VK_COLOR_COMPONENT_R_BIT | VK10.VK_COLOR_COMPONENT_G_BIT
                             | VK10.VK_COLOR_COMPONENT_B_BIT | VK10.VK_COLOR_COMPONENT_A_BIT);
             if (spec.blend == Blend.ALPHA) {
+                // Straight-alpha "over": the fragment's own rgb is scaled by ITS OWN alpha before adding —
+                // see Blend.ALPHA's doc for why this leaves the destination premultiplied once more than one
+                // layer has drawn onto it, even though every individual source is straight. Alpha channel
+                // correctly accumulates (outA = srcA + dstA*(1-srcA)) rather than preserving whatever was
+                // already there (srcAlphaFactor=ZERO/dstAlphaFactor=ONE would silently discard every
+                // feature's alpha contribution — bit us once already, see memory).
                 blendAttach.get(0).blendEnable(true)
                         .srcColorBlendFactor(VK10.VK_BLEND_FACTOR_SRC_ALPHA)
                         .dstColorBlendFactor(VK10.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
                         .colorBlendOp(VK10.VK_BLEND_OP_ADD)
-                        .srcAlphaBlendFactor(VK10.VK_BLEND_FACTOR_ZERO)
-                        .dstAlphaBlendFactor(VK10.VK_BLEND_FACTOR_ONE)
+                        .srcAlphaBlendFactor(VK10.VK_BLEND_FACTOR_ONE)
+                        .dstAlphaBlendFactor(VK10.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                        .alphaBlendOp(VK10.VK_BLEND_OP_ADD);
+            } else if (spec.blend == Blend.PREMULTIPLIED_ALPHA) {
+                // Premultiplied "over": the fragment's own rgb is used as-is (NOT re-multiplied by alpha) —
+                // for a source that already holds premultiplied content, same alpha-channel accumulation.
+                blendAttach.get(0).blendEnable(true)
+                        .srcColorBlendFactor(VK10.VK_BLEND_FACTOR_ONE)
+                        .dstColorBlendFactor(VK10.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                        .colorBlendOp(VK10.VK_BLEND_OP_ADD)
+                        .srcAlphaBlendFactor(VK10.VK_BLEND_FACTOR_ONE)
+                        .dstAlphaBlendFactor(VK10.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
                         .alphaBlendOp(VK10.VK_BLEND_OP_ADD);
             } else {
                 blendAttach.get(0).blendEnable(false);
@@ -423,6 +461,79 @@ public final class RtOverlayPipelines {
             long set = pSet.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, set, label + " descriptor set");
             return new SampledImageSet(dsl, pool, set);
+        }
+    }
+
+    /**
+     * A pool of combined-image-sampler descriptor sets sharing one layout — for overlay passes that sample
+     * MULTIPLE distinct textures within the same frame (e.g. one draw per font-atlas page), where a single
+     * descriptor set rewritten between draws (see {@link SampledImageSet}) is unsafe: descriptor sets are
+     * live objects, so every {@code vkCmdBindDescriptorSets} call recorded against the SAME set ends up
+     * sampling whichever texture was written LAST by the time the command buffer actually executes on the
+     * GPU, not whatever was bound at record time — earlier draws in the same command buffer would silently
+     * end up sampling the final page's atlas instead of their own. Each distinct view gets its own
+     * descriptor set instead, allocated and written EXACTLY ONCE ({@link #allocateAndBind}) — never mutated
+     * again — so callers should cache the returned handle per view (e.g. an
+     * {@code IdentityHashMap<GpuTextureView, Long>}) and reuse it across frames; the underlying texture view
+     * is expected to be stable for the session (a font atlas page doesn't get recreated), so there's nothing
+     * to rebind after the first time.
+     */
+    public static final class SampledImageSetPool {
+        public final long layout;
+        private final long pool;
+
+        private SampledImageSetPool(long layout, long pool) {
+            this.layout = layout;
+            this.pool = pool;
+        }
+
+        /** Allocate a fresh descriptor set from this pool and write {@code view}/{@code sampler} into it once. */
+        public long allocateAndBind(RtContext ctx, long view, long sampler) {
+            VkDevice vk = ctx.vk();
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                        .descriptorPool(pool).pSetLayouts(stack.longs(layout));
+                LongBuffer pSet = stack.mallocLong(1);
+                check(VK10.vkAllocateDescriptorSets(vk, dsai, pSet), "vkAllocateDescriptorSets(sampled image set pool)");
+                long set = pSet.get(0);
+
+                VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
+                info.get(0).sampler(sampler).imageView(view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+                VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(1, stack);
+                writes.get(0).sType$Default().dstSet(set).dstBinding(0)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(info);
+                VK10.vkUpdateDescriptorSets(vk, writes, null);
+                return set;
+            }
+        }
+
+        /** Frees every descriptor set ever allocated from this pool, along with the pool and layout. */
+        public void destroy(VkDevice vk) {
+            VK10.vkDestroyDescriptorPool(vk, pool, null);
+            VK10.vkDestroyDescriptorSetLayout(vk, layout, null);
+        }
+    }
+
+    public static SampledImageSetPool sampledImageSetPool(RtContext ctx, int stageFlags, int maxSets, String label) {
+        VkDevice vk = ctx.vk();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            LongBuffer p = stack.mallocLong(1);
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(1, stack);
+            binds.get(0).binding(0).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(stageFlags);
+            VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
+            check(VK10.vkCreateDescriptorSetLayout(vk, dslci, null, p), "vkCreateDescriptorSetLayout(" + label + ")");
+            long dsl = p.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, label + " descriptor set layout");
+
+            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(maxSets);
+            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(maxSets).pPoolSizes(poolSizes);
+            check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool(" + label + ")");
+            long pool = p.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool, label + " descriptor pool");
+
+            return new SampledImageSetPool(dsl, pool);
         }
     }
 

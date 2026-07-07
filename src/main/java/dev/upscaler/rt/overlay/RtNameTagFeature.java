@@ -45,8 +45,10 @@ import dev.upscaler.rt.entity.RtEntities;
  * <p>Glyphs are grouped by font-atlas page ({@link GpuTextureView} identity: the default ASCII page vs.
  * the unicode-fallback page, say) into one merged vertex buffer per page, each drawn with its page bound
  * as a real combined-image-sampler (not bindless — this is a plain forward raster pass, not in-RT
- * shading). Non-indexed (2 triangles/quad, 6 vertices) — text volume is small enough that doubling two
- * shared corners per quad isn't worth an index buffer.
+ * shading) — one descriptor set PER page (see {@link RtOverlayPipelines.SampledImageSetPool}), since a
+ * single set rewritten between pages would leave every draw in the command buffer sampling whichever page
+ * was bound last. Non-indexed (2 triangles/quad, 6 vertices) — text volume is small enough that doubling
+ * two shared corners per quad isn't worth an index buffer.
  */
 final class RtNameTagFeature implements RtOverlayFeature {
     // mat4 curViewProj (0, 64B) + vec3 camOffset (64, padded to 16B) = 80B.
@@ -59,11 +61,19 @@ final class RtNameTagFeature implements RtOverlayFeature {
     private static final int TEXT_COLOR = -2130706433; // 0x80FFFFFF
     private static final int BACKGROUND_COLOR = 0x40000000; // ~25% opaque black; vanilla's default opacity
 
+    // Generous cap on distinct font-atlas pages seen in one session (default ASCII + unicode fallback +
+    // headroom) — see SampledImageSetPool's doc for why each page needs its own descriptor set rather than
+    // one shared set rewritten per page.
+    private static final int MAX_ATLAS_PAGES = 16;
+
     private RtContext ctx;
     private RtOverlayPipelines.Pipeline pipeline;
-    private RtOverlayPipelines.SampledImageSet imageSet;
+    private RtOverlayPipelines.SampledImageSetPool imageSetPool;
     private long sampler;
 
+    // One descriptor set per distinct font-atlas page, allocated once and reused across frames (a page's
+    // GpuTextureView is stable for the session — see SampledImageSetPool).
+    private final Map<GpuTextureView, Long> pageSets = new IdentityHashMap<>();
     private final Map<GpuTextureView, PageBuilder> pages = new IdentityHashMap<>();
     private final GlyphCapture glyphCapture = new GlyphCapture();
     private final Matrix4f pose = new Matrix4f();
@@ -144,14 +154,14 @@ final class RtNameTagFeature implements RtOverlayFeature {
         if (pipeline != null) {
             return;
         }
-        imageSet = RtOverlayPipelines.sampledImageSet(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "name tag");
+        imageSetPool = RtOverlayPipelines.sampledImageSetPool(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, MAX_ATLAS_PAGES, "name tag");
         sampler = RtOverlayPipelines.createNearestClampSampler(ctx, "name tag font atlas");
         pipeline = new RtOverlayPipelines.Spec("name_tag.vert.spv", "name_tag.frag.spv")
                 .vertex(RtOverlayPipelines.VertexFormat.POSITION_TEX_COLOR)
                 .blend(RtOverlayPipelines.Blend.ALPHA)
                 .attachment(RtWorldOverlay.TARGET_FORMAT)
                 .push(PUSH_BYTES, VK10.VK_SHADER_STAGE_VERTEX_BIT)
-                .descriptorSetLayout(imageSet.layout)
+                .descriptorSetLayout(imageSetPool.layout)
                 .build(ctx, "name tag");
     }
 
@@ -166,9 +176,10 @@ final class RtNameTagFeature implements RtOverlayFeature {
             push.putFloat(64, camOffX).putFloat(68, camOffY).putFloat(72, camOffZ);
             VK10.vkCmdPushConstants(cmd, pipeline.layout, VK10.VK_SHADER_STAGE_VERTEX_BIT, 0, push);
             for (DrawPage page : drawPages) {
-                imageSet.bind(ctx, vkImageView(page.view), sampler);
+                long set = pageSets.computeIfAbsent(page.view,
+                        v -> imageSetPool.allocateAndBind(ctx, vkImageView(v), sampler));
                 VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
-                        stack.longs(imageSet.set), null);
+                        stack.longs(set), null);
                 VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(page.vbo.handle), stack.longs(0L));
                 VK10.vkCmdDraw(cmd, page.vertexCount, 1, 0, 0);
             }
@@ -185,10 +196,11 @@ final class RtNameTagFeature implements RtOverlayFeature {
             pipeline.destroy(ctx.vk());
             pipeline = null;
         }
-        if (imageSet != null) {
-            imageSet.destroy(ctx.vk());
-            imageSet = null;
+        if (imageSetPool != null) {
+            imageSetPool.destroy(ctx.vk());
+            imageSetPool = null;
         }
+        pageSets.clear();
         if (sampler != 0L) {
             VK10.vkDestroySampler(ctx.vk(), sampler, null);
             sampler = 0L;

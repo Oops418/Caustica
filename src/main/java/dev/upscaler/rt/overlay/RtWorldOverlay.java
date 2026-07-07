@@ -22,8 +22,11 @@ import org.lwjgl.vulkan.VkViewport;
 import java.util.ArrayList;
 import java.util.List;
 
+import dev.upscaler.UpscalerConfig;
 import dev.upscaler.rt.RtComposite;
 import dev.upscaler.rt.RtContext;
+import dev.upscaler.rt.RtDebugLabels;
+import dev.upscaler.rt.accel.RtImage;
 
 /**
  * The world-space overlay seam: full-res raster content composited over the RT world AFTER upscaling
@@ -33,22 +36,41 @@ import dev.upscaler.rt.RtContext;
  * {@code GuiRenderer.render()}.
  *
  * <p>This class owns the questions every overlay feature would otherwise re-answer: which image to
- * composite onto (currently the SDR main target — the presented image with HDR off; with HDR on the
- * presented image is {@code RtComposite}'s HDR display image and overlays are not yet visible there —
- * closing that gap means retargeting HERE, once, not per feature), the transient command buffer +
- * inter-feature barriers, per-frame vertex scratch ({@link RtOverlayFramePool}), and the failure latch.
- * Features implement {@link RtOverlayFeature}; pipelines come from {@link RtOverlayPipelines}.
+ * composite onto (a shared mod-owned overlay buffer — every feature draws into THAT, not the presented
+ * image directly, see {@link #overlayImage} below), the transient command buffer + inter-feature barriers,
+ * per-frame vertex scratch ({@link RtOverlayFramePool}), and the failure latch. Features implement
+ * {@link RtOverlayFeature}; pipelines come from {@link RtOverlayPipelines}.
+ *
+ * <p>Routing every feature through one shared buffer instead of blending straight onto vanilla's SDR
+ * {@code main} is what makes HDR support possible: {@code RtUiOverlay} already solves the identical "content
+ * authored once, composited differently per present mode" problem for the GUI (a straight blend onto
+ * {@code main} in SDR vs. a dedicated paper-white-aware compute pass, {@code hdr_ui_composite.comp}, onto
+ * the HDR display image) — {@link #record} does the same thing here: SDR blends {@link #overlayImage} onto
+ * {@code main} via a graphics pipeline, HDR instead dispatches {@link RtWorldOverlayHdrComposite} onto
+ * {@code RtComposite}'s HDR display image, gated on {@code RtComposite.INSTANCE.isHdrPresentActive()}.
+ * (Block outline's own private MSAA-mask-resolve path predates this buffer and still runs before its result
+ * ever reaches {@code overlayImage} — an FXAA pass over the shared buffer was tried and removed as looking
+ * worse than expected; MSAA remains the only edge-AA mechanism today.)
  */
 public final class RtWorldOverlay {
     public static final RtWorldOverlay INSTANCE = new RtWorldOverlay();
 
-    /** The composite target's VkFormat: vanilla's main render target ({@code GpuFormat.RGBA8_UNORM}). */
+    /** The shared overlay buffer's + presented image's VkFormat ({@code GpuFormat.RGBA8_UNORM}). */
     public static final int TARGET_FORMAT = VK10.VK_FORMAT_R8G8B8A8_UNORM;
 
     private final RtOverlayFramePool framePool = new RtOverlayFramePool();
     private final List<RtOverlayFeature> features =
             List.of(new RtGlowOutlineFeature(), new RtNameTagFeature(), new RtBlockOutlineFeature());
     private boolean failed;
+
+    // Shared world-overlay buffer every feature composites into (lazily sized to main's width/height, same
+    // lazy-resize convention as e.g. RtGlowOutlineFeature's own private mask image). sdrComposite* blends it
+    // straight onto vanilla's main target (SDR path); hdrComposite dispatches instead when HDR is active.
+    private RtContext ctxRef;
+    private RtImage overlayImage;
+    private RtOverlayPipelines.Pipeline sdrCompositePipeline;
+    private RtOverlayPipelines.StorageImageSet sdrCompositeSet;
+    private RtWorldOverlayHdrComposite hdrComposite;
 
     private RtWorldOverlay() {
     }
@@ -77,7 +99,8 @@ public final class RtWorldOverlay {
                 }
             }
             if (!ready.isEmpty()) {
-                record(ready, targetView, main.width, main.height);
+                ensureOverlayBuffer(ctx, main.width, main.height);
+                record(ctx, ready, targetView, main.width, main.height);
             }
         } catch (Throwable t) {
             failed = true;
@@ -87,15 +110,69 @@ public final class RtWorldOverlay {
         }
     }
 
-    private static void record(List<RtOverlayFeature> ready, long targetView, int width, int height) {
+    private void ensureOverlayBuffer(RtContext ctx, int width, int height) {
+        this.ctxRef = ctx;
+        if (sdrCompositePipeline == null) {
+            sdrCompositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "world overlay composite");
+            // PREMULTIPLIED_ALPHA, not ALPHA: overlayImage ends up holding premultiplied content once more
+            // than one feature has drawn into it (see Blend.ALPHA's doc) — blending it onto main with the
+            // straight-alpha recipe would double-multiply by alpha (dim/incorrect semi-transparent colour).
+            sdrCompositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "overlay_passthrough_composite.frag.spv")
+                    .blend(RtOverlayPipelines.Blend.PREMULTIPLIED_ALPHA)
+                    .attachment(TARGET_FORMAT)
+                    .descriptorSetLayout(sdrCompositeSet.layout)
+                    .build(ctx, "world overlay composite");
+        }
+        if (overlayImage == null || overlayImage.width != width || overlayImage.height != height) {
+            if (overlayImage != null) {
+                overlayImage.destroy();
+            }
+            overlayImage = ctx.createStorageImage(width, height, TARGET_FORMAT,
+                    "world overlay " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        }
+        sdrCompositeSet.bind(ctx, 0, overlayImage.view);
+    }
+
+    private void ensureHdrComposite(RtContext ctx) {
+        if (hdrComposite == null) {
+            hdrComposite = RtWorldOverlayHdrComposite.create(ctx);
+        }
+    }
+
+    private void record(RtContext ctx, List<RtOverlayFeature> ready, long targetView, int width, int height) {
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // host vertex writes + main's world writes visible
+            VulkanCommandEncoder.memoryBarrier(cmd, stack); // host vertex writes visible
+
+            long overlayView = overlayImage.view;
+            beginColorRendering(cmd, stack, overlayView, width, height, true); // clear to transparent once
+            endRendering(cmd);
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+
             for (RtOverlayFeature f : ready) {
-                f.record(cmd, targetView, width, height);
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // this feature's writes visible to the next / present
+                f.record(cmd, overlayView, width, height);
+                VulkanCommandEncoder.memoryBarrier(cmd, stack); // this feature's writes visible to the next / final composite
             }
+
+            if (RtComposite.INSTANCE.isHdrPresentActive()) {
+                long hdrView = RtComposite.INSTANCE.hdrBackbufferView();
+                if (hdrView != 0L) {
+                    ensureHdrComposite(ctx);
+                    hdrComposite.setImages(hdrView, overlayView);
+                    hdrComposite.dispatch(cmd, width, height, UpscalerConfig.Rt.Hdr.paperWhiteNits());
+                }
+            } else {
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world overlay composite")) {
+                    beginColorRendering(cmd, stack, targetView, width, height, false); // LOAD the presented image
+                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, sdrCompositePipeline.handle);
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, sdrCompositePipeline.layout, 0,
+                            stack.longs(sdrCompositeSet.set), null);
+                    VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
+                    endRendering(cmd);
+                }
+            }
+            VulkanCommandEncoder.memoryBarrier(cmd, stack); // this composite's writes visible to whatever presents next
         }
         if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
             throw new IllegalStateException("vkEndCommandBuffer(world overlay) failed");
@@ -108,6 +185,21 @@ public final class RtWorldOverlay {
         for (RtOverlayFeature f : features) {
             f.destroy();
         }
+        if (sdrCompositePipeline != null && ctxRef != null) {
+            sdrCompositePipeline.destroy(ctxRef.vk());
+            sdrCompositeSet.destroy(ctxRef.vk());
+        }
+        sdrCompositePipeline = null;
+        sdrCompositeSet = null;
+        if (hdrComposite != null) {
+            hdrComposite.destroy();
+            hdrComposite = null;
+        }
+        if (overlayImage != null) {
+            overlayImage.destroy();
+            overlayImage = null;
+        }
+        ctxRef = null;
         framePool.destroy();
     }
 

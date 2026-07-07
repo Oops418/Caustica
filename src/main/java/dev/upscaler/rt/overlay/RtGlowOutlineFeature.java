@@ -122,7 +122,7 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
                     .push(MASK_PUSH_BYTES, VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT)
                     .build(ctx, "glow mask");
             compositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "glow composite");
-            compositePipeline = new RtOverlayPipelines.Spec("entity_glow_composite.vert.spv", "entity_glow_composite.frag.spv")
+            compositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "entity_glow_composite.frag.spv")
                     .blend(RtOverlayPipelines.Blend.ALPHA)
                     .attachment(RtWorldOverlay.TARGET_FORMAT)
                     .descriptorSetLayout(compositeSet.layout)

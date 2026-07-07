@@ -19,11 +19,16 @@ public interface RtOverlayFeature {
     boolean prepare(RtContext ctx, RtOverlayFramePool pool, int width, int height);
 
     /**
-     * Record this feature's passes. {@code targetView} is the presented image's colour view
-     * ({@link RtWorldOverlay#TARGET_FORMAT}, GENERAL layout) — composite onto it with
-     * {@code loadOp = LOAD} dynamic rendering (attachment writes only: vanilla-owned images are never
-     * storage-capable). Host vertex writes are already visible; barriers between a feature's own passes
-     * are the feature's responsibility, and {@link RtWorldOverlay} barriers between features.
+     * Record this feature's passes. {@code targetView} is {@link RtWorldOverlay}'s shared, mod-owned world-
+     * overlay buffer ({@link RtWorldOverlay#TARGET_FORMAT}, GENERAL layout, cleared to transparent black
+     * once per frame before any feature runs) — NOT the presented image directly; composite onto it with
+     * {@code loadOp = LOAD} dynamic rendering and {@code RtOverlayPipelines.Blend.ALPHA} (straight-alpha
+     * "over" — see that enum constant's doc for why the shared buffer ends up premultiplied once more than
+     * one feature has drawn into it). {@link RtWorldOverlay} blends the buffer onto the real presented image
+     * (or dispatches an HDR-space composite) after every feature has drawn, so features never touch
+     * vanilla's own texture (which really isn't storage-capable, unlike this shared buffer). Host vertex
+     * writes are already visible; barriers between a feature's own passes are the feature's responsibility,
+     * and {@link RtWorldOverlay} barriers between features.
      */
     void record(VkCommandBuffer cmd, long targetView, int width, int height);
 

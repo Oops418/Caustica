@@ -198,7 +198,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                     .descriptorSetLayout(accelSet.layout)
                     .build(ctx, "block outline");
             compositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "block outline composite");
-            compositePipeline = new RtOverlayPipelines.Spec("entity_glow_composite.vert.spv", "block_outline_composite.frag.spv")
+            compositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "overlay_passthrough_composite.frag.spv")
                     .blend(RtOverlayPipelines.Blend.ALPHA)
                     .attachment(RtWorldOverlay.TARGET_FORMAT)
                     .descriptorSetLayout(compositeSet.layout)

@@ -35,6 +35,7 @@ public final class RtVideoOptions {
             exposureMode(),
             manualEv(),
             spp(),
+            maxBounces(),
             sunSize(),
             entities(),
             particles(),
@@ -85,6 +86,17 @@ public final class RtVideoOptions {
             (caption, value) -> Options.genericValueLabel(caption, value),
             new OptionInstance.IntRange(1, 8),
             Math.clamp(setting.value(), 1, 8),
+            setting::set);
+    }
+
+    private static OptionInstance<Integer> maxBounces() {
+        IntSetting setting = UpscalerConfig.Rt.Composite.MAX_BOUNCES;
+        return new OptionInstance<>(
+            "upscaler.options.rt.maxBounces",
+            OptionInstance.cachedConstantTooltip(Component.translatable("upscaler.options.rt.maxBounces.tooltip")),
+            (caption, value) -> Options.genericValueLabel(caption, value),
+            new OptionInstance.IntRange(2, 8),
+            Math.clamp(setting.value(), 2, 8),
             setting::set);
     }
 

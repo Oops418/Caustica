@@ -56,7 +56,7 @@ public final class UpscalerConfig {
     public static void ensureRegistered() {
         @SuppressWarnings("unused")
         Object[] touch = {
-            Rt.ENABLED, Rt.Composite.SPP, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
+            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.BufferPool.STATS, Rt.FrameStats.ENABLED,
             Rt.Hdr.ENABLED, Ngx.PATH,
@@ -528,6 +528,8 @@ public final class UpscalerConfig {
         public static final class Composite {
             public static final IntSetting DEBUG_VIEW = intValue("upscaler.rt.debugView", "composite.debug-view", 0);
             public static final IntSetting SPP = intAtLeast("upscaler.rt.spp", "composite.spp", 1, 1);
+            public static final IntSetting MAX_BOUNCES =
+                    clampedInt("upscaler.rt.maxBounces", "composite.max-bounces", 4, 2, 8);
             public static final BooleanSetting WATER_WAVES =
                     bool("upscaler.rt.waterWaves", "composite.water-waves", true);
             public static final FloatSetting SUN_ANGULAR_RADIUS =

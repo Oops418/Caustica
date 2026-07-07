@@ -81,6 +81,7 @@ public final class RtComposite {
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
     // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 4 = water waves
+    // + maxBounces(@196)
     // + dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
     // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
     // + W1/W2 water: waterParams(@320) xyz=camera-biome tint, w=wave time; waterAnchor(@336) xy=wave anchor
@@ -103,6 +104,10 @@ public final class RtComposite {
 
     private static int spp() {
         return UpscalerConfig.Rt.Composite.SPP.value();
+    }
+
+    private static int maxBounces() {
+        return UpscalerConfig.Rt.Composite.MAX_BOUNCES.value();
     }
 
     private static boolean waterWaves() {
@@ -751,6 +756,7 @@ public final class RtComposite {
                 flags |= 0b10000; // W1: animated water wave normals
             }
             push.putInt(192, flags);
+            push.putInt(196, maxBounces());
             writeSky(push);
 
             // W1/W2 water params @320 (sunUv@288 / moonUv@304 belong to the sky push above): xyz = the

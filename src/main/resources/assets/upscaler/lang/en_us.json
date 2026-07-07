@@ -12,6 +12,9 @@
 	"upscaler.options.rt.spp": "Samples Per Pixel",
 	"upscaler.options.rt.spp.tooltip": "Path-tracing samples taken per pixel each frame. Higher is cleaner but more demanding.",
 
+	"upscaler.options.rt.maxBounces": "Path Bounces",
+	"upscaler.options.rt.maxBounces.tooltip": "Maximum number of secondary path-tracing bounces after the primary hit. Higher captures more indirect light but costs more.",
+
 	"upscaler.options.rt.sunSize": "Sun Size",
 	"upscaler.options.rt.sunSize.tooltip": "Angular radius of the sun and moon disk. Larger discs cast softer shadow penumbrae.",
 

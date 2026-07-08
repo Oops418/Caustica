@@ -18,6 +18,7 @@ import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelineFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelinePropertiesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayQueryFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapFeaturesEXT;
@@ -45,6 +46,8 @@ import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_STRUCTURE_TYPE_PHYSICAL_DEV
 import static org.lwjgl.vulkan.NVLowLatency2.VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRPresentId.VK_KHR_PRESENT_ID_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRPresentId.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+import static org.lwjgl.vulkan.EXTRayTracingInvocationReorder.VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME;
+import static org.lwjgl.vulkan.EXTRayTracingInvocationReorder.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT;
 
 /**
  * RT device bring-up. Enables the hardware ray-tracing device extensions and their
@@ -76,13 +79,19 @@ public final class RtDeviceBringup {
      * {@code ray_query} lets fragment shaders (the world-overlay pass, e.g. block outline) issue inline
      * {@code rayQueryEXT} occlusion tests against the same TLAS the ray-tracing pipeline traces, without a
      * dedicated raygen dispatch. Same RTX-GPU support floor as the rest of this list.
+     * {@code ray_tracing_invocation_reorder} (SER): world.rgen reorders threads by hit coherence
+     * ({@code hitObjectTraceRayEXT} + {@code reorderThreadEXT} + {@code hitObjectExecuteShaderEXT}) before
+     * shading, so the divergent per-instance Section/Prim fetches in world.rchit/world.rahit hit more
+     * coherently. First pass: required, no fallback path — a device without it fails RT bring-up entirely
+     * (same as the other entries in this list) rather than silently tracing without reordering.
      */
     public static final List<String> RT_EXTENSIONS = List.of(
             VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
             VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
             VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
             VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
-            VK_KHR_RAY_QUERY_EXTENSION_NAME);
+            VK_KHR_RAY_QUERY_EXTENSION_NAME,
+            VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
 
     /**
      * OPTIONAL RT extensions: enabled only when the selected device supports them AND the gate is on, but
@@ -250,6 +259,11 @@ public final class RtDeviceBringup {
         VulkanPNextStruct rayQueryStruct = new VulkanPNextStruct(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
                 VkPhysicalDeviceRayQueryFeaturesKHR.SIZEOF);
+        // SER (world.rgen hitObjectTraceRayEXT/reorderThreadEXT/hitObjectExecuteShaderEXT). Required, no
+        // fallback — see the RT_EXTENSIONS doc comment.
+        VulkanPNextStruct serStruct = new VulkanPNextStruct(
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT,
+                VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.SIZEOF);
         // bufferDeviceAddress merges into vanilla's existing Vulkan12Features struct.
         features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "bufferDeviceAddress",
                 VkPhysicalDeviceVulkan12Features.BUFFERDEVICEADDRESS));
@@ -275,6 +289,8 @@ public final class RtDeviceBringup {
                 VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR.RAYTRACINGPOSITIONFETCH));
         features.add(new VulkanFeature(rayQueryStruct, "rayQuery",
                 VkPhysicalDeviceRayQueryFeaturesKHR.RAYQUERY));
+        features.add(new VulkanFeature(serStruct, "rayTracingInvocationReorder",
+                VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.RAYTRACINGINVOCATIONREORDER));
 
         // Optional: wideLines (core VK10 feature, no extension). Lets the world-overlay pass (block
         // outline) draw a real thick native line via a raster pipeline's lineWidth / VK_DYNAMIC_STATE_LINE
@@ -329,7 +345,7 @@ public final class RtDeviceBringup {
 
         rtRequested = true;
         CandelaMod.LOGGER.info(
-                "Ray tracing: enabling {}{}{} + features [bufferDeviceAddress, accelerationStructure, rayTracingPipeline, rayQuery"
+                "Ray tracing: enabling {}{}{} + features [bufferDeviceAddress, accelerationStructure, rayTracingPipeline, rayQuery, rayTracingInvocationReorder"
                         + (wideLinesEnabled ? ", wideLines(max=" + maxLineWidth + ")" : "")
                         + (ommEnabled ? ", opacityMicromap" : "") + "] + overlayMsaa=" + overlayMsaaSamples + "x on [{}]",
                 RT_EXTENSIONS, ommEnabled ? " + " + OPTIONAL_RT_EXTENSIONS : "",

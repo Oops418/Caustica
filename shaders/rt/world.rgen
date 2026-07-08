@@ -4,6 +4,12 @@
 // constant, so raygen now needs buffer-reference + 64-bit integer support (the hit shaders already had them).
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// SER (VK_EXT_ray_tracing_invocation_reorder): the GLSL extension string follows GL_NV_shader_invocation_reorder's
+// naming (GL_EXT_shader_invocation_reorder), NOT "GL_EXT_ray_tracing_invocation_reorder" despite the Vulkan/device
+// extension being named that way — the "ray_tracing_" infix is dropped at the GLSL layer. Confirmed by disassembly:
+// this lowers to OpCapability ShaderInvocationReorderEXT / OpExtension "SPV_EXT_shader_invocation_reorder", matching
+// the VK_EXT device extension required (no fallback) in RtDeviceBringup.
+#extension GL_EXT_shader_invocation_reorder : require
 
 // P3.1a: brute-force path tracer ("vanilla-pt"). Perspective primary rays from Minecraft's camera.
 // invViewProj = inverse(proj * viewRot) maps clip -> camera-relative world. We reconstruct the ray
@@ -14,8 +20,8 @@
 //
 // Lighting is an iterative path-tracing loop in raygen (the plan's "iterative loop in raygen", not
 // recursion from closest-hit, so maxRayRecursionDepth stays 1). At each surface vertex we do:
-//   * NEE toward the sun — a single analytic directional light, gated by one shadow ray (missIndex 1,
-//     shadow.rmiss, TerminateOnFirstHit | SkipClosestHit). Lambertian BRDF = albedo/PI.
+//   * NEE toward the sun — a single analytic directional light, gated by one hit-object visibility query
+//     (TerminateOnFirstHit | SkipClosestHit). Lambertian BRDF = albedo/PI.
 //   * a cosine-weighted Lambertian continuation ray (throughput *= albedo; the PI and cos cancel).
 // Sky / ambient light needs no separate AO pass: continuation rays that escape land in world.rmiss,
 // which returns sky radiance — so soft sky fill and contact AO both fall out of the path integral.
@@ -105,7 +111,7 @@ struct Payload {
     float rayConeSpread; // footprint growth per world unit travelled by this ray
 };
 layout(location = 0) rayPayloadEXT Payload payload;
-layout(location = 1) rayPayloadEXT vec4 shadowVis; // rgb = transmittance, a = 1.0 if the visibility ray escaped
+layout(location = 1) rayPayloadEXT vec4 shadowVis; // rgb = transmittance; a is unused by hit-object visibility
 
 const float PI = 3.14159265359;
 const float INV_PI = 0.31830988618;
@@ -367,13 +373,15 @@ const uint SBT_SHADOW = TERRAIN_BUCKETS;
 const uint SBT_STRIDE_BUCKET = 1u;
 
 vec3 visibility(vec3 origin, vec3 dir, float tmax) {
-    shadowVis = vec4(1.0, 1.0, 1.0, 0.0); // alpha stays 0 unless shadow.rmiss proves the ray escaped
+    shadowVis = vec4(1.0, 1.0, 1.0, 0.0);
     // Shadow SBT records run any-hit only for cutout/translucent/water. Cutout alpha-tests; translucent
-    // and water tint shadowVis.rgb and pass through. Solid blocks skip any-hit and terminate the ray.
-    traceRayEXT(topLevelAS,
+    // and water tint shadowVis.rgb and pass through. Solid blocks terminate traversal. There is no closest
+    // or miss shader worth executing, so use a hit object only as the traversal result.
+    hitObjectEXT hObj;
+    hitObjectTraceRayEXT(hObj, topLevelAS,
                 gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 1u, origin, RAY_TMIN, dir, tmax, 1);
-    return shadowVis.a > 0.5 ? shadowVis.rgb : vec3(0.0);
+                CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 0u, origin, RAY_TMIN, dir, tmax, 1);
+    return hitObjectIsMissEXT(hObj) ? shadowVis.rgb : vec3(0.0);
 }
 
 vec2 projectPrevNdc(vec3 worldPos) {
@@ -421,7 +429,8 @@ vec2 specularReflectionMotion(vec3 surfacePos, vec3 primaryDir, vec2 currentNdc,
     payload.hitT = -1.0;
     payload.rayConeWidth = max(length(surfacePos - pc.camOffset) * primaryConeSpread, RAY_CONE_MIN_WIDTH);
     payload.rayConeSpread = max(primaryConeSpread, RAY_CONE_MIN_SPREAD);
-    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, CULL_SECONDARY,
+    hitObjectEXT hObj;
+    hitObjectTraceReorderExecuteEXT(hObj, topLevelAS, gl_RayFlagsNoneEXT, CULL_SECONDARY,
                 SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, surfacePos + n * SURF_BIAS, RAY_TMIN, specDir, 10000.0, 0);
 
     vec3 reflectedHit;
@@ -468,7 +477,8 @@ void refractedGuideHit(vec3 surfacePos, vec3 incidentDir, vec3 surfaceNormal, bo
     payload.hitT = -1.0;
     payload.rayConeWidth = rayConeWidth;
     payload.rayConeSpread = rayConeSpread;
-    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, CULL_SECONDARY,
+    hitObjectEXT hObj;
+    hitObjectTraceReorderExecuteEXT(hObj, topLevelAS, gl_RayFlagsNoneEXT, CULL_SECONDARY,
                 SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, ro, RAY_TMIN, refractedDir, 10000.0, 0);
     if (payload.hitT < 0.0) {
         hitCamRel = (ro + refractedDir * 1.0e6) - pc.camOffset; // sky through the surface, at infinity
@@ -523,7 +533,11 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
         // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
         // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the first-person
         // player. Bounce rays are secondary (CULL_SECONDARY): exclude particles, include the player.
-        traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY,
+        // SER: trace into a hit object, reorder threads by hit coherence, THEN invoke the hit/miss shader —
+        // this is where the divergent Section/Prim shading work (world.rchit/world.rahit) actually happens,
+        // so reordering before it is what pays for the reorder's own cost.
+        hitObjectEXT hObj;
+        hitObjectTraceReorderExecuteEXT(hObj, topLevelAS, gl_RayFlagsNoneEXT, bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY,
                     SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, ro, 0.0, rd, 10000.0, 0);
 
         if (payload.hitT < 0.0) {

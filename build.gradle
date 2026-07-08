@@ -133,9 +133,27 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
 
 def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
-def ngxNativeConfig = (findProperty("ngxNativeConfig") ?: "release").toString().toLowerCase(java.util.Locale.ROOT)
+def requestedTaskNames = gradle.startParameter.taskNames.collect { it.toLowerCase(java.util.Locale.ROOT) }
+def isRunClientInvocation = requestedTaskNames.any { it == "runclient" || it.endsWith(":runclient") }
+def ngxShimConfig = (findProperty("ngxShimConfig") ?: findProperty("ngxNativeConfig") ?: "release")
+		.toString().toLowerCase(java.util.Locale.ROOT)
+def normalizeNgxVendorConfig = { String config ->
+	def normalized = config.toLowerCase(java.util.Locale.ROOT)
+	if (normalized == "release") {
+		return "rel"
+	}
+	if (normalized == "debug") {
+		return "dev"
+	}
+	if (normalized != "rel" && normalized != "dev") {
+		throw new GradleException("Unknown NGX vendor config '${config}'. Expected 'rel' or 'dev'.")
+	}
+	return normalized
+}
+def ngxVendorConfig = normalizeNgxVendorConfig(
+		(findProperty("ngxVendorConfig") ?: (isRunClientInvocation ? "dev" : "rel")).toString())
 def ngxNativeRoot = layout.buildDirectory.dir("native/ngx_shim").get().asFile
-def ngxShimOutDir = new File(ngxNativeRoot, ngxNativeConfig)
+def ngxShimOutDir = new File(ngxNativeRoot, ngxShimConfig)
 def currentNgxPlatform = {
 	def os = org.gradle.internal.os.OperatingSystem.current()
 	def arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT)
@@ -154,7 +172,7 @@ def ngxNativePlatforms = [
 		shimIncludes: [
 			"ngxshim.dll"
 		],
-		vendorRoot: { dlssSdkRoot -> new File(dlssSdkRoot, "lib/Windows_x86_64/rel") },
+		vendorRoot: { dlssSdkRoot, vendorConfig -> new File(dlssSdkRoot, "lib/Windows_x86_64/${vendorConfig}") },
 		vendorIncludes: [
 			"nvngx_dlssd.dll",
 			"nvngx_dlssg.dll"
@@ -165,7 +183,7 @@ def ngxNativePlatforms = [
 		shimIncludes: [
 			"libngxshim.so"
 		],
-		vendorRoot: { dlssSdkRoot -> new File(dlssSdkRoot, "lib/Linux_x86_64/rel") },
+		vendorRoot: { dlssSdkRoot, vendorConfig -> new File(dlssSdkRoot, "lib/Linux_x86_64/${vendorConfig}") },
 		vendorIncludes: [
 			"libnvidia-ngx-dlssd.so*",
 			"libnvidia-ngx-dlssg.so*"
@@ -198,13 +216,16 @@ def dlssSdkRootProvider = dlssSdkEnv.map { file(it) }
 
 def bundleNgxNatives = tasks.register("bundleNgxNatives") {
 	group = "build"
-	description = "Bundles NGX shim and DLSS native libraries into the mod resources."
+	description = "Bundles NGX shim and ${ngxVendorConfig} DLSS native libraries into the mod resources."
+
+	inputs.property "ngxShimConfig", ngxShimConfig
+	inputs.property "ngxVendorConfig", ngxVendorConfig
 
 	selectedNgxNativePlatforms.each { platform ->
 		inputs.files(fileTree(ngxShimOutDir) {
 			include platform.shimIncludes
 		}).withPropertyName("ngxNatives.${platform.name}.shim")
-		inputs.files(fileTree(platform.vendorRoot(dlssSdkRootProvider.getOrElse(file("__missing_dlss_sdk__")))) {
+		inputs.files(fileTree(platform.vendorRoot(dlssSdkRootProvider.getOrElse(file("__missing_dlss_sdk__")), ngxVendorConfig)) {
 			include platform.vendorIncludes
 		}).withPropertyName("ngxNatives.${platform.name}.vendor")
 	}
@@ -227,7 +248,7 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives") {
 			}
 		}
 		selectedNgxNativePlatforms.each { platform ->
-			def platformVendorRoot = platform.vendorRoot(dlssSdkRoot)
+			def platformVendorRoot = platform.vendorRoot(dlssSdkRoot, ngxVendorConfig)
 			def missingVendorIncludes = platform.vendorIncludes.findAll { vendorInclude ->
 				fileTree(platformVendorRoot) {
 					include vendorInclude
@@ -248,7 +269,7 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives") {
 				}) {
 					into "candela/natives/${platform.name}"
 				}
-				from(fileTree(platform.vendorRoot(dlssSdkRoot))) {
+				from(fileTree(platform.vendorRoot(dlssSdkRoot, ngxVendorConfig))) {
 					include platform.vendorIncludes
 					into "candela/natives/${platform.name}"
 				}

@@ -9,13 +9,13 @@ changes while the renderer is being built.
 
 ## Features
 
-- Hardware ray-traced world rendering for Minecraft's Vulkan renderer
+- Vulkan hardware path-traced world rendering
 - DLSS Ray Reconstruction support
-- Optional DLSS Frame Generation (experimental)
-- Optional HDR output
-- Ray-traced terrain lighting and materials
+- DLSS Frame Generation support (experimental)
+- HDR output
 - Dynamic entity rendering in the ray-traced scene
 - LabPBR-style material support
+- OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations
 
 ## Requirements
 
@@ -57,3 +57,9 @@ UI-only mods are more likely to work.
 Candela is not a finished renderer yet. Current work focuses on visual
 correctness, world coverage, stability, and making the SDR/HDR presentation
 paths behave consistently.
+
+## TODO List
+
+- [ ] NRD + FSR for non-NVIDIA GPUs
+- [ ] LOD
+- [ ] ReSTIR

@@ -1,8 +1,8 @@
 {
 	"schemaVersion": 1,
-	"id": "upscaler",
+	"id": "candela",
 	"version": "${version}",
-	"name": "Upscaler",
+	"name": "Candela",
 	"description": "Hardware-ray-traced renderer with DLSS Ray Reconstruction for the Minecraft Vulkan backend.",
 	"authors": [
 		"i"
@@ -11,14 +11,14 @@
 	"environment": "client",
 	"entrypoints": {
 		"main": [
-			"dev.upscaler.UpscalerMod"
+			"dev.comfyfluffy.candela.CandelaMod"
 		],
 		"client": [
-			"dev.upscaler.client.UpscalerClient"
+			"dev.comfyfluffy.candela.client.CandelaClient"
 		]
 	},
 	"mixins": [
-		"upscaler.mixins.json"
+		"candela.mixins.json"
 	],
 	"depends": {
 		"fabricloader": ">=0.19.3",

@@ -1,5 +1,5 @@
 {
-  description = "Development environment for the Minecraft DLSS/upscaler mod";
+  description = "Development environment for the Minecraft DLSS/Candela mod";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

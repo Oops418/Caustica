@@ -57,6 +57,8 @@ import org.lwjgl.system.MemoryUtil;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Future;
 
@@ -1063,6 +1065,48 @@ public final class RtTerrain {
         }
     }
 
+    // Whole-sprite average {r, g, b, a} for TRANSLUCENT-bucket sprites (stained glass, ice, …), keyed by
+    // sprite identity. world.rahit's shadow-ray path reads this (packed into the prim's otherwise-unused
+    // mat lane for translucent triangles — see emit()) instead of sampling blockAtlas per-hit: a shadow
+    // ray only needs the pane's overall tint/opacity, not per-texel pattern detail, and this is by far
+    // the hottest per-hit texture read in the any-hit shader. Computed lazily from worker threads during
+    // tessellation, so it must be concurrency-safe; sprite objects (and this cache) are invalidated for
+    // free by the next atlas stitch replacing them with new instances.
+    private static final Map<TextureAtlasSprite, float[]> TRANSLUCENT_AVG_CACHE = new ConcurrentHashMap<>();
+
+    private static float[] translucentAvgColor(TextureAtlasSprite sprite) {
+        float[] cached = TRANSLUCENT_AVG_CACHE.get(sprite);
+        if (cached != null) {
+            return cached;
+        }
+        float[] avg = computeAvgColor(sprite);
+        TRANSLUCENT_AVG_CACHE.put(sprite, avg);
+        return avg;
+    }
+
+    /** Average {r, g, b, a} (0..1) over every texel of a sprite's first frame. */
+    private static float[] computeAvgColor(TextureAtlasSprite sprite) {
+        var contents = sprite.contents();
+        int width = contents.width();
+        int height = contents.height();
+        NativeImage image = ((SpriteContentsAccessor) contents).candela$originalImage();
+        if (image == null || width <= 0 || height <= 0) {
+            return new float[]{1f, 1f, 1f, 0f};
+        }
+        long sr = 0, sg = 0, sb = 0, sa = 0;
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int px = image.getPixel(x, y); // frame 0 always occupies the image's top-left tile
+                sr += ARGB.red(px);
+                sg += ARGB.green(px);
+                sb += ARGB.blue(px);
+                sa += ARGB.alpha(px);
+            }
+        }
+        float count = (float) width * height * 255f;
+        return new float[]{sr / count, sg / count, sb / count, sa / count};
+    }
+
     /**
      * Snapshot each missing section on the render thread and submit its tessellation to the worker
      * pool. The per-task meshing objects (renderer / captures / MutableBlockPos) are allocated inside the
@@ -2051,7 +2095,10 @@ public final class RtTerrain {
         // aligned with `idx`'s triangle order so the hit shader reads cornerUv[3*pid + k] directly with no
         // index->vertex-UV gather. The index buffer is still emitted (above) for the BLAS build.
         final FloatArrayList cornerUv;
-        final FloatArrayList prim;   // 12 floats/triangle: normal.xyz+emission, tint.rgb+material, mat.{rough,metal,hasS,hasN}
+        // 12 floats/triangle: normal.xyz+emission, tint.rgb+material, mat.{rough,metal,hasS,hasN} —
+        // except TRANSLUCENT triangles, whose mat lane instead holds a precomputed sprite avg {r,g,b,a}
+        // (see emit()/translucentAvgColor).
+        final FloatArrayList prim;
         // One sprite per prim record (per triangle), aligned with `prim`. Resolved on the render thread
         // because RtBlockMaterials.ensure can lazy-load material maps.
         final SpriteList materialSprites;
@@ -2195,7 +2242,10 @@ public final class RtTerrain {
             q.metal = RtMaterials.metalness(state);
             TextureAtlasSprite sprite = quad.materialInfo().sprite();
             q.sprite = sprite;
-            q.materialSprite = sprite;
+            // TRANSLUCENT prims repurpose the mat lane for a precomputed avg color/alpha (emit(), for
+            // world.rahit's shadow path) instead of LabPBR hasS/hasN flags, so keep materialSprite null —
+            // resolveMaterials() already skips null entries, which avoids it clobbering that lane.
+            q.materialSprite = q.translucent ? null : sprite;
         }
 
         /** Acquire a pooled PendingQuad for the current block (grown on demand, count reset by flushBlock). */
@@ -2331,6 +2381,16 @@ public final class RtTerrain {
             addTriUv(g, q.uv[0], q.uv[1], q.uv[2]);
             addTriUv(g, q.uv[0], q.uv[2], q.uv[3]);
             FloatArrayList prim = g.prim;
+            // TRANSLUCENT prims never read mat.{rough,metal,hasS,hasN} in either hit shader (world.rchit's
+            // stained-glass/ice early return hardcodes roughness/metalness and never checks hasS/hasN), so
+            // the mat lane is repurposed to carry this sprite's precomputed whole-texture average {r,g,b,a}
+            // instead — world.rahit's shadow path reads it rather than sampling blockAtlas per-hit. Biome
+            // tint is pre-multiplied into the stored rgb here (a per-quad CPU-side multiply) so that shadow
+            // path never needs pr.tint.rgb at all — just the one 16-byte mat lane, not a second scattered
+            // load elsewhere in the 48-byte Prim record. rchit's radiance path still reads the real,
+            // un-multiplied tint.rgb from the prim's own tint lane (written below as usual) for its
+            // per-texel shading, so this doesn't affect how glass looks head-on.
+            float[] avgColor = q.translucent ? translucentAvgColor(q.sprite) : null;
             for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
                 prim.add(q.nx);
                 prim.add(q.ny);
@@ -2342,10 +2402,17 @@ public final class RtTerrain {
                 prim.add(q.tg);
                 prim.add(q.tb);
                 prim.add(q.translucent ? 2f : 0f); // tint.w material flag: 2 = stained glass / ice (0 opaque)
-                prim.add(q.rough);
-                prim.add(q.metal);
-                prim.add(0f); // hasS placeholder; patched by resolveMaterials()
-                prim.add(0f); // hasN placeholder
+                if (avgColor != null) {
+                    prim.add(avgColor[0] * q.tr);
+                    prim.add(avgColor[1] * q.tg);
+                    prim.add(avgColor[2] * q.tb);
+                    prim.add(avgColor[3]);
+                } else {
+                    prim.add(q.rough);
+                    prim.add(q.metal);
+                    prim.add(0f); // hasS placeholder; patched by resolveMaterials()
+                    prim.add(0f); // hasN placeholder
+                }
                 g.materialSprites.add(q.materialSprite);
                 g.ommSprites.add(q.sprite);
             }

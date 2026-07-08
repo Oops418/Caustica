@@ -15,7 +15,10 @@
 struct Prim {
     vec4 normal;
     vec4 tint;
-    vec4 mat; // P6.1: unused here, but the array stride must match world.rchit / the uploaded buffer (48 B)
+    // P6.1: {rough, metal, hasS, hasN} for solid/cutout — the array stride must match world.rchit / the
+    // uploaded buffer (48 B). TRANSLUCENT-bucket prims repurpose this lane for a precomputed whole-sprite
+    // average {r, g, b, a} instead (RtTerrain.emit()/translucentAvgColor) — see BUCKET_TRANSLUCENT below.
+    vec4 mat;
 };
 struct Section {
     uint64_t primAddr;
@@ -62,6 +65,11 @@ const int IDX_MASK = 0x3FFFFF;     // low 22 bits = geom-table index (strips ENT
 const uint BUCKET_CUTOUT = 1u;
 const uint BUCKET_TRANSLUCENT = 2u;
 const uint BUCKET_WATER = 3u;
+// Faint baseline extinction added to every translucent hit regardless of its color, so perfectly clear
+// glass/ice still dims a shadow ray a little instead of being fully invisible to it (real glass isn't a
+// perfect transmitter either). Additive with the color-derived extinction below, not a floor/clamp — a
+// tinted pane still absorbs its own color on top of this.
+const float TRANSLUCENT_NEUTRAL_EXTINCTION = 0.15;
 const float WATER_SHADOW_TINT = 0.5;
 
 // Progressive 8x8 blue-noise-style alpha threshold pattern, with a golden-ratio temporal rotation. This keeps
@@ -129,20 +137,39 @@ void main() {
         return;
     }
 
-    // Cutout/translucent geometry: alpha/tint from the atlas. gl_PrimitiveID restarts at 0 per geometry,
-    // so re-add this bucket's triangle base to index the section's packed UV arrays.
-    UVs uvs = UVs(sec.uvAddr);
-    vec2 uv = bary.x * uvs.uv[3u * tri + 0u] + bary.y * uvs.uv[3u * tri + 1u] + bary.z * uvs.uv[3u * tri + 2u];
-
-    // Translucent radiance rays use a closest-hit-only SBT record. Shadow rays tint and pass through.
+    // Translucent radiance rays use a closest-hit-only SBT record; shadow rays tint and pass through here.
+    // Unlike the cutout path below, this doesn't touch the atlas at all: sampling+interpolating a UV per
+    // shadow hit was the hottest texture read in the any-hit shader (a shadow ray only needs the pane's
+    // overall tint/opacity, not the per-texel pattern the eye would see — world.rchit's radiance path
+    // still samples per-texel for that). pr.mat carries a precomputed whole-sprite average {r,g,b,a} with
+    // biome tint already baked in at pack time (RtTerrain.emit()/translucentAvgColor), so this reads only
+    // the one 16-byte mat lane of the 48-byte Prim record — not a second, separately-scattered tint load.
+    //
+    // Modeled as Beer-Lambert absorption (matching the water medium in world.rgen) rather than a flat
+    // alpha-lerp toward the raw average color: a per-channel extinction is derived from how dark that
+    // average is, scaled by the average alpha (how much of the sprite is glass-colorant vs. see-through
+    // frame), so richly saturated panes darken transmitted light non-linearly instead of just fading
+    // linearly toward flat paint. Multiplying into shadowVis.rgb (rather than mixing from a fresh
+    // vec3(1.0)) blends this absorption with the light color already accumulated by any surfaces the
+    // shadow ray crossed earlier — stacked colored panes compound correctly.
     if (bucket == BUCKET_TRANSLUCENT) {
         Prim pr = Prims(sec.primAddr).p[tri];
-        vec4 gtex = textureLod(blockAtlas, uv, 0.0);
-        shadowVis.rgb *= mix(vec3(1.0), gtex.rgb * pr.tint.rgb, gtex.a);
+        vec3 avgColor = max(pr.mat.rgb, vec3(1.0e-3));
+        vec3 colorExtinction = max(-log(avgColor), vec3(0.0));
+        // The neutral floor is a flat per-hit dimming, NOT scaled by alpha: vanilla clear glass has a low
+        // natural alpha (that's what makes the alpha-blended render layer look see-through), so folding it
+        // into the alpha-scaled term crushed it to near-zero for exactly the white/clear-glass case it's
+        // meant to cover. Only the color-derived term scales with alpha (how saturated the pane's own tint
+        // is); every translucent hit still pays the flat neutral cost regardless.
+        shadowVis.rgb *= exp(-colorExtinction * pr.mat.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
         ignoreIntersectionEXT;
         return;
     }
 
+    // Cutout geometry: alpha from the atlas. gl_PrimitiveID restarts at 0 per geometry, so re-add this
+    // bucket's triangle base to index the section's packed UV arrays.
+    UVs uvs = UVs(sec.uvAddr);
+    vec2 uv = bary.x * uvs.uv[3u * tri + 0u] + bary.y * uvs.uv[3u * tri + 1u] + bary.z * uvs.uv[3u * tri + 2u];
     if (textureLod(blockAtlas, uv, 0.0).a < ALPHA_CUTOFF) {
         ignoreIntersectionEXT;
     }

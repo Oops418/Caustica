@@ -13,7 +13,10 @@
 struct Prim {
     vec4 normal;
     vec4 tint;
-    vec4 mat; // P6.1: {roughness, metalness, 0, 0} heuristic PBR material (RtMaterials)
+    // P6.1: {roughness, metalness, hasS, hasN} heuristic PBR material (RtMaterials). Unread by the
+    // TRANSLUCENT (stained glass / ice) early return below, whose prim records repurpose this lane for a
+    // precomputed avg sprite color instead — see world.rahit's shadow-ray BUCKET_TRANSLUCENT path.
+    vec4 mat;
 };
 struct Section {
     uint64_t primAddr;

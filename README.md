@@ -64,6 +64,7 @@ Candela is licensed under the MIT License. See [LICENSE.md](LICENSE.md).
 
 ## TODO List
 
+- [ ] Nether/End sky, weather, volumetric fog/clouds
 - [ ] NRD + FSR for non-NVIDIA GPUs
 - [ ] LOD
 - [ ] ReSTIR

@@ -1292,6 +1292,11 @@ public final class RtTerrain {
                 ws.reset(dispatch.blockColors());
                 ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, dispatch.blockColors());
                 FluidRenderer fluidRenderer = new FluidRenderer(dispatch.fluidModelSet());
+                // RT-only: snap covered max-height water columns to full height so the phantom 8/9 surface
+                // under solid ceilings (a TIR mirror to the path tracer) is culled. Opt-in is per-instance —
+                // this instance is thread-confined to this job, and vanilla's own FluidRenderers stay stock
+                // for the RT-off raster path. See FluidRendererMixin.
+                ((RtFluidRendererHooks) fluidRenderer).caustica$enableSnapCoveredWater();
                 CpuSection cpu = buildCpuSection(region, dispatch.modelSet(), renderer, ws.capture,
                         fluidRenderer, ws.fluidCapture, ws.mesh, ws.pos, sx, sy, sz);
                 enqueueCompleted(job, cpu, null);
